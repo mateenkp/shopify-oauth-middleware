@@ -7,7 +7,7 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware to parse JSON bodies (needed for webhooks)
+// IMPORTANT: Add JSON body parser for webhooks
 app.use(express.json());
 
 // Configuration from environment variables
@@ -18,7 +18,6 @@ const SCOPES = 'read_customers,write_customers,read_orders,write_orders,read_pro
 
 // Function to verify HMAC for OAuth
 function verifyHmac(query, hmac) {
-  // Create a copy of query without hmac and signature
   const params = Object.keys(query)
     .filter(key => key !== 'hmac' && key !== 'signature')
     .sort()
@@ -37,7 +36,7 @@ function verifyHmac(query, hmac) {
   return hash === hmac;
 }
 
-// Function to verify webhook HMAC signatures
+// NEW: Function to verify webhook HMAC signatures
 function verifyWebhook(data, hmac) {
   const hash = crypto
     .createHmac('sha256', SHOPIFY_API_SECRET)
@@ -64,11 +63,9 @@ app.get('/install', (req, res) => {
     return res.status(400).send('Missing shop parameter. Please provide ?shop=your-store.myshopify.com');
   }
   
-  // Generate random state for security
   const state = crypto.randomBytes(16).toString('hex');
   const redirectUri = `${process.env.APP_URL}/callback`;
   
-  // Build Shopify authorization URL
   const installUrl = `https://${shop}/admin/oauth/authorize?` +
     `client_id=${SHOPIFY_API_KEY}&` +
     `scope=${SCOPES}&` +
@@ -78,13 +75,10 @@ app.get('/install', (req, res) => {
   console.log('Initiating OAuth for shop:', shop);
   console.log('Redirect URI:', redirectUri);
   
-  // In production, store state in Redis/database
-  // For now, we'll skip state verification
-  
   res.redirect(installUrl);
 });
 
-// Route 2: OAuth Callback (Shopify redirects here after authorization)
+// Route 2: OAuth Callback
 app.get('/callback', async (req, res) => {
   const { shop, code, hmac, state } = req.query;
   
@@ -92,7 +86,6 @@ app.get('/callback', async (req, res) => {
   console.log('Shop:', shop);
   console.log('Code received:', code ? 'Yes' : 'No');
   
-  // Verify HMAC signature
   if (!verifyHmac(req.query, hmac)) {
     console.error('HMAC validation failed');
     return res.status(400).send('HMAC validation failed. This request may not be from Shopify.');
@@ -100,7 +93,6 @@ app.get('/callback', async (req, res) => {
   
   console.log('HMAC validated successfully');
   
-  // Exchange authorization code for access token
   try {
     console.log('Exchanging code for access token...');
     
@@ -119,7 +111,6 @@ app.get('/callback', async (req, res) => {
     console.log('Access token obtained successfully');
     console.log('Granted scopes:', scope);
     
-    // Send token to Bubble
     console.log('Sending token to Bubble:', BUBBLE_API_ENDPOINT);
     
     await axios.post(BUBBLE_API_ENDPOINT, {
@@ -131,22 +122,20 @@ app.get('/callback', async (req, res) => {
     
     console.log('Token stored in Bubble successfully');
     
-    // Redirect to success page in Bubble
-    const successUrl = process.env.BUBBLE_SUCCESS_URL || `https://your-katicrm.bubbleapps.io/shopify-connected?shop=${shop}&success=true`;
+    const successUrl = process.env.BUBBLE_SUCCESS_URL || `https://katicrm.com/version-test/shopify-connected?shop=${shop}&success=true`;
     res.redirect(successUrl);
     
   } catch (error) {
     console.error('OAuth error:', error.response?.data || error.message);
     
-    // Redirect to error page
-    const errorUrl = process.env.BUBBLE_ERROR_URL || `https://your-katicrm.bubbleapps.io/shopify-connected?success=false&error=${encodeURIComponent(error.message)}`;
+    const errorUrl = process.env.BUBBLE_ERROR_URL || `https://katicrm.com/version-test/shopify-connected?success=false&error=${encodeURIComponent(error.message)}`;
     res.redirect(errorUrl);
   }
 });
 
-// ==========================================
-// GDPR COMPLIANCE WEBHOOKS
-// ==========================================
+// ===========================================
+// NEW: GDPR COMPLIANCE WEBHOOK ENDPOINTS
+// ===========================================
 
 // Webhook 1: Customer Data Request
 app.post('/webhooks/customers/data_request', async (req, res) => {
@@ -177,7 +166,8 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   // Optional: Forward to Bubble for processing
   if (BUBBLE_API_ENDPOINT) {
     try {
-      await axios.post(`${BUBBLE_API_ENDPOINT}/gdpr/data_request`, {
+      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/save_shopify_connection', '/gdpr/data_request');
+      await axios.post(gdprEndpoint, {
         shop: shop,
         customer_email: req.body.customer?.email,
         customer_id: req.body.customer?.id,
@@ -221,7 +211,8 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   // Optional: Forward to Bubble for processing
   if (BUBBLE_API_ENDPOINT) {
     try {
-      await axios.post(`${BUBBLE_API_ENDPOINT}/gdpr/customer_redact`, {
+      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/save_shopify_connection', '/gdpr/customer_redact');
+      await axios.post(gdprEndpoint, {
         shop: shop,
         customer_email: req.body.customer?.email,
         customer_id: req.body.customer?.id,
@@ -263,7 +254,8 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   // Optional: Forward to Bubble for processing
   if (BUBBLE_API_ENDPOINT) {
     try {
-      await axios.post(`${BUBBLE_API_ENDPOINT}/gdpr/shop_redact`, {
+      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/save_shopify_connection', '/gdpr/shop_redact');
+      await axios.post(gdprEndpoint, {
         shop: shop,
         shop_id: req.body.shop_id,
         shop_domain: req.body.shop_domain,
@@ -278,9 +270,9 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   res.status(200).send('Shop data will be redacted');
 });
 
-// ==========================================
+// ===========================================
 // END GDPR COMPLIANCE WEBHOOKS
-// ==========================================
+// ===========================================
 
 // Root endpoint with instructions
 app.get('/', (req, res) => {
