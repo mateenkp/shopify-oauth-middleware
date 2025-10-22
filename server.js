@@ -166,7 +166,7 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   // Optional: Forward to Bubble for processing
   if (BUBBLE_API_ENDPOINT) {
     try {
-      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/save_shopify_connection', '/gdpr/data_request');
+      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request');
       await axios.post(gdprEndpoint, {
         shop: shop,
         customer_email: req.body.customer?.email,
@@ -211,7 +211,7 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   // Optional: Forward to Bubble for processing
   if (BUBBLE_API_ENDPOINT) {
     try {
-      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/save_shopify_connection', '/gdpr/customer_redact');
+      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact');
       await axios.post(gdprEndpoint, {
         shop: shop,
         customer_email: req.body.customer?.email,
@@ -254,7 +254,7 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   // Optional: Forward to Bubble for processing
   if (BUBBLE_API_ENDPOINT) {
     try {
-      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/save_shopify_connection', '/gdpr/shop_redact');
+      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact');
       await axios.post(gdprEndpoint, {
         shop: shop,
         shop_id: req.body.shop_id,
