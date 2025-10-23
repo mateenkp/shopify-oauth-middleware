@@ -420,6 +420,22 @@ app.get('/', (req, res) => {
   `);
 });
 
+// --- Shopify mandatory compliance webhooks ---
+app.post("/shopify/customers_data_request", (req, res) => {
+  console.log("✅ Received customers_data_request:", req.body);
+  res.status(200).send({ status: "ok" });
+});
+
+app.post("/shopify/customers_redact", (req, res) => {
+  console.log("✅ Received customers_redact:", req.body);
+  res.status(200).send({ status: "ok" });
+});
+
+app.post("/shopify/shop_redact", (req, res) => {
+  console.log("✅ Received shop_redact:", req.body);
+  res.status(200).send({ status: "ok" });
+});
+
 // Start server
 app.listen(PORT, () => {
   console.log('=================================');
