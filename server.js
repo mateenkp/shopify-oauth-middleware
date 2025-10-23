@@ -14,7 +14,6 @@ const BUBBLE_API_ENDPOINT = process.env.BUBBLE_API_ENDPOINT;
 const SCOPES = 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations';
 
 // CRITICAL: Capture raw body for webhook verification BEFORE parsing
-// This matches Shopify's official documentation
 app.use('/webhooks', express.raw({ type: 'application/json' }));
 
 // Regular JSON parsing for other routes
@@ -40,21 +39,42 @@ function verifyHmac(query, hmac) {
   return hash === hmac;
 }
 
-// FIXED: Function to verify webhook HMAC signatures using raw body
-// Uses timing-safe comparison as recommended by Shopify
+// FIXED: Improved webhook verification with better debugging
 function verifyWebhook(rawBody, hmac) {
-  const calculatedHmac = crypto
-    .createHmac('sha256', SHOPIFY_API_SECRET)
-    .update(rawBody, 'utf8')
-    .digest('base64');
-  
-  // Use timing-safe comparison to prevent timing attacks
+  if (!hmac) {
+    console.error('❌ No HMAC header provided');
+    return false;
+  }
+
+  if (!SHOPIFY_API_SECRET) {
+    console.error('❌ SHOPIFY_API_SECRET not configured');
+    return false;
+  }
+
   try {
-    return crypto.timingSafeEqual(
+    // Convert Buffer to string if needed
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    
+    console.log('🔐 Verifying HMAC...');
+    console.log('Body length:', bodyString.length);
+    console.log('Received HMAC:', hmac.substring(0, 10) + '...');
+    
+    const calculatedHmac = crypto
+      .createHmac('sha256', SHOPIFY_API_SECRET)
+      .update(bodyString, 'utf8')
+      .digest('base64');
+    
+    console.log('Calculated HMAC:', calculatedHmac.substring(0, 10) + '...');
+    
+    const isValid = crypto.timingSafeEqual(
       Buffer.from(calculatedHmac, 'base64'),
       Buffer.from(hmac, 'base64')
     );
-  } catch (e) {
+    
+    console.log('HMAC valid:', isValid);
+    return isValid;
+  } catch (error) {
+    console.error('❌ HMAC verification error:', error.message);
     return false;
   }
 }
@@ -64,7 +84,8 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy',
     timestamp: new Date().toISOString(),
-    message: 'Shopify OAuth Middleware is running'
+    message: 'Shopify OAuth Middleware is running',
+    shopifySecretConfigured: !!SHOPIFY_API_SECRET
   });
 });
 
@@ -147,21 +168,31 @@ app.get('/callback', async (req, res) => {
 });
 
 // ===========================================
-// GDPR COMPLIANCE WEBHOOK ENDPOINTS (PRODUCTION-READY)
+// GDPR COMPLIANCE WEBHOOK ENDPOINTS
 // ===========================================
 
 // Webhook 1: Customer Data Request
 app.post('/webhooks/customers/data_request', async (req, res) => {
-  const shop = req.get('X-Shopify-Shop-Domain');
-  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const shop = req.get('X-Shopify-Shop-Domain') || req.get('x-shopify-shop-domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
   
-  console.log('📋 Customer data request received from:', shop);
+  console.log('📋 Customer data request received');
+  console.log('Shop:', shop);
+  console.log('Headers:', JSON.stringify(req.headers, null, 2));
   
-  // Parse the body (req.body is raw Buffer because of express.raw())
+  // Parse the body
   const rawBody = req.body;
-  const body = JSON.parse(rawBody.toString('utf8'));
+  let body;
   
-  // Verify webhook authenticity using RAW body
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+  } catch (e) {
+    console.error('❌ Failed to parse body:', e.message);
+    return res.status(400).send('Invalid JSON');
+  }
+  
+  // Verify webhook authenticity
   if (!verifyWebhook(rawBody, hmac)) {
     console.error('❌ Webhook verification failed for data_request');
     return res.status(401).send('Unauthorized');
@@ -171,21 +202,13 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   console.log('Customer email:', body.customer?.email);
   console.log('Customer ID:', body.customer?.id);
   
-  // IMPORTANT: Respond with 200 OK immediately (within 5 seconds)
+  // Respond immediately
   res.status(200).send('Data request received and logged');
   
-  // Process asynchronously (don't block the response)
+  // Process asynchronously
   setImmediate(async () => {
-    // Log for compliance records
-    console.log('Data request details:', {
-      shop: shop,
-      customer_email: body.customer?.email,
-      customer_id: body.customer?.id,
-      orders_requested: body.orders_requested,
-      timestamp: new Date().toISOString()
-    });
+    console.log('Processing data request...');
     
-    // Forward to Bubble for processing
     if (BUBBLE_API_ENDPOINT) {
       try {
         const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request');
@@ -205,39 +228,37 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
 
 // Webhook 2: Customer Redact
 app.post('/webhooks/customers/redact', async (req, res) => {
-  const shop = req.get('X-Shopify-Shop-Domain');
-  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const shop = req.get('X-Shopify-Shop-Domain') || req.get('x-shopify-shop-domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
   
-  console.log('🗑️ Customer redaction request received from:', shop);
+  console.log('🗑️ Customer redaction request received');
+  console.log('Shop:', shop);
   
   // Parse the body
   const rawBody = req.body;
-  const body = JSON.parse(rawBody.toString('utf8'));
+  let body;
   
-  // Verify webhook authenticity using RAW body
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+  } catch (e) {
+    console.error('❌ Failed to parse body:', e.message);
+    return res.status(400).send('Invalid JSON');
+  }
+  
+  // Verify webhook authenticity
   if (!verifyWebhook(rawBody, hmac)) {
     console.error('❌ Webhook verification failed for customer redact');
     return res.status(401).send('Unauthorized');
   }
   
   console.log('✅ Webhook verified successfully');
-  console.log('Customer to redact:', body.customer?.email);
   
-  // IMPORTANT: Respond with 200 OK immediately
+  // Respond immediately
   res.status(200).send('Customer data will be redacted');
   
   // Process asynchronously
   setImmediate(async () => {
-    // Log for compliance records
-    console.log('Customer redaction details:', {
-      shop: shop,
-      customer_email: body.customer?.email,
-      customer_id: body.customer?.id,
-      orders_to_redact: body.orders_to_redact,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Forward to Bubble for processing
     if (BUBBLE_API_ENDPOINT) {
       try {
         const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact');
@@ -255,18 +276,29 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   });
 });
 
-// Webhook 3: Shop Redact (Store uninstalled)
+// Webhook 3: Shop Redact
 app.post('/webhooks/shop/redact', async (req, res) => {
-  const shop = req.get('X-Shopify-Shop-Domain');
-  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const shop = req.get('X-Shopify-Shop-Domain') || req.get('x-shopify-shop-domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
   
-  console.log('🏪 Shop redaction request received from:', shop);
+  console.log('🏪 Shop redaction request received');
+  console.log('Shop:', shop);
+  console.log('All headers:', Object.keys(req.headers));
   
   // Parse the body
   const rawBody = req.body;
-  const body = JSON.parse(rawBody.toString('utf8'));
+  let body;
   
-  // Verify webhook authenticity using RAW body
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+    console.log('Body parsed successfully:', JSON.stringify(body));
+  } catch (e) {
+    console.error('❌ Failed to parse body:', e.message);
+    return res.status(400).send('Invalid JSON');
+  }
+  
+  // Verify webhook authenticity
   if (!verifyWebhook(rawBody, hmac)) {
     console.error('❌ Webhook verification failed for shop redact');
     return res.status(401).send('Unauthorized');
@@ -274,20 +306,11 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   
   console.log('✅ Webhook verified successfully');
   
-  // IMPORTANT: Respond with 200 OK immediately
+  // Respond immediately
   res.status(200).send('Shop data will be redacted');
   
   // Process asynchronously
   setImmediate(async () => {
-    // Log for compliance records
-    console.log('Shop redaction details:', {
-      shop: shop,
-      shop_id: body.shop_id,
-      shop_domain: body.shop_domain,
-      timestamp: new Date().toISOString()
-    });
-    
-    // Forward to Bubble for processing
     if (BUBBLE_API_ENDPOINT) {
       try {
         const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact');
@@ -304,11 +327,7 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   });
 });
 
-// ===========================================
-// END GDPR COMPLIANCE WEBHOOKS
-// ===========================================
-
-// Root endpoint with instructions
+// Root endpoint
 app.get('/', (req, res) => {
   res.send(`
     <html>
@@ -366,7 +385,8 @@ app.get('/', (req, res) => {
         <h2>Status:</h2>
         <p>✅ Middleware is running correctly</p>
         <p>⚙️ Configured for: ${BUBBLE_API_ENDPOINT ? 'Bubble endpoint configured' : 'Bubble endpoint NOT configured'}</p>
-        <p>🔐 GDPR webhooks: Production-ready with timing-safe verification</p>
+        <p>🔐 GDPR webhooks: Production-ready with debugging</p>
+        <p>🔑 Shopify Secret: ${SHOPIFY_API_SECRET ? 'Configured' : 'NOT configured'}</p>
       </body>
     </html>
   `);
