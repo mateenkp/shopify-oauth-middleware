@@ -5,7 +5,7 @@ const querystring = require('querystring');
 require('dotenv').config();
 
 const app = express();
-const PORT = process.env.PORT || 30001;
+const PORT = process.env.PORT || 3000;
 
 // Configuration from environment variables
 const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
