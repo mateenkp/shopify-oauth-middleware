@@ -7,14 +7,17 @@ require('dotenv').config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// IMPORTANT: Add JSON body parser for webhooks
-app.use(express.json());
-
 // Configuration from environment variables
 const SHOPIFY_API_KEY = process.env.SHOPIFY_API_KEY;
 const SHOPIFY_API_SECRET = process.env.SHOPIFY_API_SECRET;
 const BUBBLE_API_ENDPOINT = process.env.BUBBLE_API_ENDPOINT;
 const SCOPES = 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations';
+
+// CRITICAL: Capture raw body for webhook verification BEFORE parsing
+app.use('/webhooks', express.raw({ type: 'application/json' }));
+
+// Regular JSON parsing for other routes
+app.use(express.json());
 
 // Function to verify HMAC for OAuth
 function verifyHmac(query, hmac) {
@@ -36,11 +39,11 @@ function verifyHmac(query, hmac) {
   return hash === hmac;
 }
 
-// NEW: Function to verify webhook HMAC signatures
-function verifyWebhook(data, hmac) {
+// FIXED: Function to verify webhook HMAC signatures using raw body
+function verifyWebhook(rawBody, hmac) {
   const hash = crypto
     .createHmac('sha256', SHOPIFY_API_SECRET)
-    .update(JSON.stringify(data), 'utf8')
+    .update(rawBody, 'utf8')
     .digest('base64');
   
   return hash === hmac;
@@ -134,7 +137,7 @@ app.get('/callback', async (req, res) => {
 });
 
 // ===========================================
-// NEW: GDPR COMPLIANCE WEBHOOK ENDPOINTS
+// GDPR COMPLIANCE WEBHOOK ENDPOINTS (FIXED)
 // ===========================================
 
 // Webhook 1: Customer Data Request
@@ -144,22 +147,26 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   
   console.log('📋 Customer data request received from:', shop);
   
-  // Verify webhook authenticity
-  if (!verifyWebhook(req.body, hmac)) {
+  // Parse the body (req.body is raw Buffer because of express.raw())
+  const rawBody = req.body.toString('utf8');
+  const body = JSON.parse(rawBody);
+  
+  // Verify webhook authenticity using RAW body
+  if (!verifyWebhook(rawBody, hmac)) {
     console.error('❌ Webhook verification failed for data_request');
     return res.status(401).send('Unauthorized');
   }
   
   console.log('✅ Webhook verified successfully');
-  console.log('Customer email:', req.body.customer?.email);
-  console.log('Customer ID:', req.body.customer?.id);
+  console.log('Customer email:', body.customer?.email);
+  console.log('Customer ID:', body.customer?.id);
   
   // Log for compliance records
   console.log('Data request details:', {
     shop: shop,
-    customer_email: req.body.customer?.email,
-    customer_id: req.body.customer?.id,
-    orders_requested: req.body.orders_requested,
+    customer_email: body.customer?.email,
+    customer_id: body.customer?.id,
+    orders_requested: body.orders_requested,
     timestamp: new Date().toISOString()
   });
   
@@ -169,9 +176,9 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
       const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request');
       await axios.post(gdprEndpoint, {
         shop: shop,
-        customer_email: req.body.customer?.email,
-        customer_id: req.body.customer?.id,
-        orders_requested: req.body.orders_requested,
+        customer_email: body.customer?.email,
+        customer_id: body.customer?.id,
+        orders_requested: body.orders_requested,
         timestamp: new Date().toISOString()
       });
       console.log('📤 Data request forwarded to Bubble');
@@ -190,21 +197,25 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   
   console.log('🗑️ Customer redaction request received from:', shop);
   
-  // Verify webhook authenticity
-  if (!verifyWebhook(req.body, hmac)) {
+  // Parse the body
+  const rawBody = req.body.toString('utf8');
+  const body = JSON.parse(rawBody);
+  
+  // Verify webhook authenticity using RAW body
+  if (!verifyWebhook(rawBody, hmac)) {
     console.error('❌ Webhook verification failed for customer redact');
     return res.status(401).send('Unauthorized');
   }
   
   console.log('✅ Webhook verified successfully');
-  console.log('Customer to redact:', req.body.customer?.email);
+  console.log('Customer to redact:', body.customer?.email);
   
   // Log for compliance records
   console.log('Customer redaction details:', {
     shop: shop,
-    customer_email: req.body.customer?.email,
-    customer_id: req.body.customer?.id,
-    orders_to_redact: req.body.orders_to_redact,
+    customer_email: body.customer?.email,
+    customer_id: body.customer?.id,
+    orders_to_redact: body.orders_to_redact,
     timestamp: new Date().toISOString()
   });
   
@@ -214,9 +225,9 @@ app.post('/webhooks/customers/redact', async (req, res) => {
       const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact');
       await axios.post(gdprEndpoint, {
         shop: shop,
-        customer_email: req.body.customer?.email,
-        customer_id: req.body.customer?.id,
-        orders_to_redact: req.body.orders_to_redact,
+        customer_email: body.customer?.email,
+        customer_id: body.customer?.id,
+        orders_to_redact: body.orders_to_redact,
         timestamp: new Date().toISOString()
       });
       console.log('📤 Redaction request forwarded to Bubble');
@@ -235,8 +246,12 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   
   console.log('🏪 Shop redaction request received from:', shop);
   
-  // Verify webhook authenticity
-  if (!verifyWebhook(req.body, hmac)) {
+  // Parse the body
+  const rawBody = req.body.toString('utf8');
+  const body = JSON.parse(rawBody);
+  
+  // Verify webhook authenticity using RAW body
+  if (!verifyWebhook(rawBody, hmac)) {
     console.error('❌ Webhook verification failed for shop redact');
     return res.status(401).send('Unauthorized');
   }
@@ -246,8 +261,8 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   // Log for compliance records
   console.log('Shop redaction details:', {
     shop: shop,
-    shop_id: req.body.shop_id,
-    shop_domain: req.body.shop_domain,
+    shop_id: body.shop_id,
+    shop_domain: body.shop_domain,
     timestamp: new Date().toISOString()
   });
   
@@ -257,8 +272,8 @@ app.post('/webhooks/shop/redact', async (req, res) => {
       const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact');
       await axios.post(gdprEndpoint, {
         shop: shop,
-        shop_id: req.body.shop_id,
-        shop_domain: req.body.shop_domain,
+        shop_id: body.shop_id,
+        shop_domain: body.shop_domain,
         timestamp: new Date().toISOString()
       });
       console.log('📤 Shop redaction request forwarded to Bubble');
