@@ -14,6 +14,7 @@ const BUBBLE_API_ENDPOINT = process.env.BUBBLE_API_ENDPOINT;
 const SCOPES = 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations';
 
 // CRITICAL: Capture raw body for webhook verification BEFORE parsing
+// This matches Shopify's official documentation
 app.use('/webhooks', express.raw({ type: 'application/json' }));
 
 // Regular JSON parsing for other routes
@@ -40,13 +41,22 @@ function verifyHmac(query, hmac) {
 }
 
 // FIXED: Function to verify webhook HMAC signatures using raw body
+// Uses timing-safe comparison as recommended by Shopify
 function verifyWebhook(rawBody, hmac) {
-  const hash = crypto
+  const calculatedHmac = crypto
     .createHmac('sha256', SHOPIFY_API_SECRET)
     .update(rawBody, 'utf8')
     .digest('base64');
   
-  return hash === hmac;
+  // Use timing-safe comparison to prevent timing attacks
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(calculatedHmac, 'base64'),
+      Buffer.from(hmac, 'base64')
+    );
+  } catch (e) {
+    return false;
+  }
 }
 
 // Health check endpoint
@@ -137,7 +147,7 @@ app.get('/callback', async (req, res) => {
 });
 
 // ===========================================
-// GDPR COMPLIANCE WEBHOOK ENDPOINTS (FIXED)
+// GDPR COMPLIANCE WEBHOOK ENDPOINTS (PRODUCTION-READY)
 // ===========================================
 
 // Webhook 1: Customer Data Request
@@ -148,8 +158,8 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   console.log('📋 Customer data request received from:', shop);
   
   // Parse the body (req.body is raw Buffer because of express.raw())
-  const rawBody = req.body.toString('utf8');
-  const body = JSON.parse(rawBody);
+  const rawBody = req.body;
+  const body = JSON.parse(rawBody.toString('utf8'));
   
   // Verify webhook authenticity using RAW body
   if (!verifyWebhook(rawBody, hmac)) {
@@ -161,33 +171,36 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   console.log('Customer email:', body.customer?.email);
   console.log('Customer ID:', body.customer?.id);
   
-  // Log for compliance records
-  console.log('Data request details:', {
-    shop: shop,
-    customer_email: body.customer?.email,
-    customer_id: body.customer?.id,
-    orders_requested: body.orders_requested,
-    timestamp: new Date().toISOString()
-  });
-  
-  // Optional: Forward to Bubble for processing
-  if (BUBBLE_API_ENDPOINT) {
-    try {
-      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request');
-      await axios.post(gdprEndpoint, {
-        shop: shop,
-        customer_email: body.customer?.email,
-        customer_id: body.customer?.id,
-        orders_requested: body.orders_requested,
-        timestamp: new Date().toISOString()
-      });
-      console.log('📤 Data request forwarded to Bubble');
-    } catch (error) {
-      console.error('Error forwarding to Bubble:', error.message);
-    }
-  }
-  
+  // IMPORTANT: Respond with 200 OK immediately (within 5 seconds)
   res.status(200).send('Data request received and logged');
+  
+  // Process asynchronously (don't block the response)
+  setImmediate(async () => {
+    // Log for compliance records
+    console.log('Data request details:', {
+      shop: shop,
+      customer_email: body.customer?.email,
+      customer_id: body.customer?.id,
+      orders_requested: body.orders_requested,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Forward to Bubble for processing
+    if (BUBBLE_API_ENDPOINT) {
+      try {
+        const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request');
+        await axios.post(gdprEndpoint, {
+          shop: shop,
+          customer_email: body.customer?.email,
+          customer_id: body.customer?.id,
+          orders_requested: body.orders_requested
+        });
+        console.log('📤 Data request forwarded to Bubble');
+      } catch (error) {
+        console.error('Error forwarding to Bubble:', error.message);
+      }
+    }
+  });
 });
 
 // Webhook 2: Customer Redact
@@ -198,8 +211,8 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   console.log('🗑️ Customer redaction request received from:', shop);
   
   // Parse the body
-  const rawBody = req.body.toString('utf8');
-  const body = JSON.parse(rawBody);
+  const rawBody = req.body;
+  const body = JSON.parse(rawBody.toString('utf8'));
   
   // Verify webhook authenticity using RAW body
   if (!verifyWebhook(rawBody, hmac)) {
@@ -210,33 +223,36 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   console.log('✅ Webhook verified successfully');
   console.log('Customer to redact:', body.customer?.email);
   
-  // Log for compliance records
-  console.log('Customer redaction details:', {
-    shop: shop,
-    customer_email: body.customer?.email,
-    customer_id: body.customer?.id,
-    orders_to_redact: body.orders_to_redact,
-    timestamp: new Date().toISOString()
-  });
-  
-  // Optional: Forward to Bubble for processing
-  if (BUBBLE_API_ENDPOINT) {
-    try {
-      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact');
-      await axios.post(gdprEndpoint, {
-        shop: shop,
-        customer_email: body.customer?.email,
-        customer_id: body.customer?.id,
-        orders_to_redact: body.orders_to_redact,
-        timestamp: new Date().toISOString()
-      });
-      console.log('📤 Redaction request forwarded to Bubble');
-    } catch (error) {
-      console.error('Error forwarding to Bubble:', error.message);
-    }
-  }
-  
+  // IMPORTANT: Respond with 200 OK immediately
   res.status(200).send('Customer data will be redacted');
+  
+  // Process asynchronously
+  setImmediate(async () => {
+    // Log for compliance records
+    console.log('Customer redaction details:', {
+      shop: shop,
+      customer_email: body.customer?.email,
+      customer_id: body.customer?.id,
+      orders_to_redact: body.orders_to_redact,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Forward to Bubble for processing
+    if (BUBBLE_API_ENDPOINT) {
+      try {
+        const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact');
+        await axios.post(gdprEndpoint, {
+          shop: shop,
+          customer_email: body.customer?.email,
+          customer_id: body.customer?.id,
+          orders_to_redact: body.orders_to_redact
+        });
+        console.log('📤 Redaction request forwarded to Bubble');
+      } catch (error) {
+        console.error('Error forwarding to Bubble:', error.message);
+      }
+    }
+  });
 });
 
 // Webhook 3: Shop Redact (Store uninstalled)
@@ -247,8 +263,8 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   console.log('🏪 Shop redaction request received from:', shop);
   
   // Parse the body
-  const rawBody = req.body.toString('utf8');
-  const body = JSON.parse(rawBody);
+  const rawBody = req.body;
+  const body = JSON.parse(rawBody.toString('utf8'));
   
   // Verify webhook authenticity using RAW body
   if (!verifyWebhook(rawBody, hmac)) {
@@ -258,31 +274,34 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   
   console.log('✅ Webhook verified successfully');
   
-  // Log for compliance records
-  console.log('Shop redaction details:', {
-    shop: shop,
-    shop_id: body.shop_id,
-    shop_domain: body.shop_domain,
-    timestamp: new Date().toISOString()
-  });
-  
-  // Optional: Forward to Bubble for processing
-  if (BUBBLE_API_ENDPOINT) {
-    try {
-      const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact');
-      await axios.post(gdprEndpoint, {
-        shop: shop,
-        shop_id: body.shop_id,
-        shop_domain: body.shop_domain,
-        timestamp: new Date().toISOString()
-      });
-      console.log('📤 Shop redaction request forwarded to Bubble');
-    } catch (error) {
-      console.error('Error forwarding to Bubble:', error.message);
-    }
-  }
-  
+  // IMPORTANT: Respond with 200 OK immediately
   res.status(200).send('Shop data will be redacted');
+  
+  // Process asynchronously
+  setImmediate(async () => {
+    // Log for compliance records
+    console.log('Shop redaction details:', {
+      shop: shop,
+      shop_id: body.shop_id,
+      shop_domain: body.shop_domain,
+      timestamp: new Date().toISOString()
+    });
+    
+    // Forward to Bubble for processing
+    if (BUBBLE_API_ENDPOINT) {
+      try {
+        const gdprEndpoint = BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact');
+        await axios.post(gdprEndpoint, {
+          shop: shop,
+          shop_id: body.shop_id,
+          shop_domain: body.shop_domain
+        });
+        console.log('📤 Shop redaction request forwarded to Bubble');
+      } catch (error) {
+        console.error('Error forwarding to Bubble:', error.message);
+      }
+    }
+  });
 });
 
 // ===========================================
@@ -347,7 +366,7 @@ app.get('/', (req, res) => {
         <h2>Status:</h2>
         <p>✅ Middleware is running correctly</p>
         <p>⚙️ Configured for: ${BUBBLE_API_ENDPOINT ? 'Bubble endpoint configured' : 'Bubble endpoint NOT configured'}</p>
-        <p>🔐 GDPR webhooks: Active and ready</p>
+        <p>🔐 GDPR webhooks: Production-ready with timing-safe verification</p>
       </body>
     </html>
   `);
@@ -359,6 +378,6 @@ app.listen(PORT, () => {
   console.log('Shopify OAuth Middleware Started');
   console.log(`Port: ${PORT}`);
   console.log(`Health check: http://localhost:${PORT}/health`);
-  console.log('🔐 GDPR webhooks enabled');
+  console.log('🔐 GDPR webhooks enabled (production-ready)');
   console.log('=================================');
 });
