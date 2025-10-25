@@ -351,15 +351,6 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   });
 });
 
-app.get('/webhooks', (req, res) => {
-  res.status(200).json({
-    "webhooks": {
-      "customers/data_request": `${BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact')}`,
-      "customers/redact": `${BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request')}`,
-      "shop/redact": `${BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact')}`
-    }
-  });
-});
 
 
 // ===========================================
