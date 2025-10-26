@@ -375,6 +375,33 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   });
 });
 
+// Base webhook endpoint - for Shopify's HMAC verification test
+app.post('/webhooks', async (req, res) => {
+  console.log('⚠️ Base /webhooks endpoint called');
+  
+  const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
+  
+  console.log('HMAC present:', hmac ? 'Yes' : 'No');
+  console.log('User-Agent:', req.get('user-agent'));
+  
+  if (!hmac) {
+    console.log('❌ No HMAC - returning 401 Unauthorized');
+    return res.status(401).send('Unauthorized: HMAC signature required');
+  }
+  
+  // Parse the body
+  const rawBody = req.body;
+  
+  // Verify HMAC
+  if (!verifyWebhook(rawBody, hmac)) {
+    console.log('❌ Invalid HMAC - returning 401 Unauthorized');
+    return res.status(401).send('Unauthorized: Invalid HMAC signature');
+  }
+  
+  console.log('✅ Valid HMAC but no specific topic handler');
+  res.status(200).send('Webhook received');
+});
+
 // ===========================================
 // END GDPR COMPLIANCE WEBHOOKS
 // ===========================================
