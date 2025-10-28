@@ -879,17 +879,7 @@ app.get('/', async (req, res) => {
   }
   
   try {
-    // Check if shop is already authenticated
-    const shopData = await getShop(validatedShop);
-    
-    if (shopData && shopData.accessToken) {
-      // Already authenticated - redirect to Bubble app
-      logger.info('Authenticated shop accessing app', { shop: validatedShop });
-      const redirectUrl = `${CONFIG.bubble.successUrl}?shop=${validatedShop}&token=${shopData.accessToken}`;
-      return res.redirect(redirectUrl);
-    }
-    
-    // Not authenticated - start OAuth flow
+    // Always start OAuth flow (removed skip logic for testing)
     logger.info('Starting OAuth flow', { shop: validatedShop, requestId: req.id });
     
     const state = generateNonce();
