@@ -97,7 +97,10 @@ const logger = {
       error: error ? {
         message: error.message,
         stack: error.stack,
-        ...error,
+        code: error.code,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        data: error.response?.data,
       } : null,
       ...meta,
     }));
@@ -644,7 +647,8 @@ async function sendToBubble(endpoint, data, retries = 3) {
       logger.error(`Bubble request failed (attempt ${attempt}/${retries})`, error, {
         endpoint,
         status: error.response?.status,
-        data: error.response?.data,
+        statusText: error.response?.statusText,
+        bubbleError: error.response?.data,
       });
       
       // Don't retry on 4xx errors (client errors)
