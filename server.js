@@ -69,6 +69,52 @@ const CONFIG = {
 };
 
 // ===========================================
+// STRUCTURED LOGGING
+// ===========================================
+
+const logger = {
+  info: (message, meta = {}) => {
+    console.log(JSON.stringify({
+      level: 'info',
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta,
+    }));
+  },
+  warn: (message, meta = {}) => {
+    console.warn(JSON.stringify({
+      level: 'warn',
+      timestamp: new Date().toISOString(),
+      message,
+      ...meta,
+    }));
+  },
+  error: (message, error = null, meta = {}) => {
+    console.error(JSON.stringify({
+      level: 'error',
+      timestamp: new Date().toISOString(),
+      message,
+      error: error ? {
+        message: error.message,
+        stack: error.stack,
+        ...error,
+      } : null,
+      ...meta,
+    }));
+  },
+  debug: (message, meta = {}) => {
+    if (NODE_ENV === 'development') {
+      console.log(JSON.stringify({
+        level: 'debug',
+        timestamp: new Date().toISOString(),
+        message,
+        ...meta,
+      }));
+    }
+  },
+};
+
+// ===========================================
 // STORAGE LAYER (Redis or In-Memory)
 // ===========================================
 
@@ -130,52 +176,6 @@ if (CONFIG.redis.enabled) {
     },
   };
 }
-
-// ===========================================
-// STRUCTURED LOGGING
-// ===========================================
-
-const logger = {
-  info: (message, meta = {}) => {
-    console.log(JSON.stringify({
-      level: 'info',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta,
-    }));
-  },
-  warn: (message, meta = {}) => {
-    console.warn(JSON.stringify({
-      level: 'warn',
-      timestamp: new Date().toISOString(),
-      message,
-      ...meta,
-    }));
-  },
-  error: (message, error = null, meta = {}) => {
-    console.error(JSON.stringify({
-      level: 'error',
-      timestamp: new Date().toISOString(),
-      message,
-      error: error ? {
-        message: error.message,
-        stack: error.stack,
-        ...error,
-      } : null,
-      ...meta,
-    }));
-  },
-  debug: (message, meta = {}) => {
-    if (NODE_ENV === 'development') {
-      console.log(JSON.stringify({
-        level: 'debug',
-        timestamp: new Date().toISOString(),
-        message,
-        ...meta,
-      }));
-    }
-  },
-};
 
 // ===========================================
 // VALIDATION & SANITIZATION
