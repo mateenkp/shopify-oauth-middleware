@@ -966,6 +966,7 @@ app.get('/auth/callback', async (req, res) => {
       access_token: accessToken,
       scope: scope,
       installed_at: new Date().toISOString(),
+      connected_at: new Date().toISOString(),  // Bubble expects this parameter name
     });
     
     if (!bubbleResult.success) {
