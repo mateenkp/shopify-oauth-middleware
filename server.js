@@ -18,9 +18,15 @@ const BUBBLE_API_ENDPOINT = process.env.BUBBLE_API_ENDPOINT;
 const BUBBLE_GDPR_DATA_REQUEST = process.env.BUBBLE_GDPR_DATA_REQUEST;
 const BUBBLE_GDPR_CUSTOMER_REDACT = process.env.BUBBLE_GDPR_CUSTOMER_REDACT;
 const BUBBLE_GDPR_SHOP_REDACT = process.env.BUBBLE_GDPR_SHOP_REDACT;
-const BUBBLE_SUCCESS_URL = process.env.BUBBLE_SUCCESS_URL;
-const BUBBLE_ERROR_URL = process.env.BUBBLE_ERROR_URL;
-const SCOPES = 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_discounts,write_discounts,customer_read_companies,customer_write_companies';
+const BUBBLE_SUCCESS_URL = process.env.BUBBLE_SUCCESS_URL || 'https://d334.bubble.is/version-test/shopify_dashboard';
+const BUBBLE_ERROR_URL = process.env.BUBBLE_ERROR_URL || 'https://d334.bubble.is/version-test/error';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'change-this-password';
+const SCOPES = 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_discounts,write_discounts,read_company_locations,read_fulfillments,write_fulfillments';
+
+// In-memory store for OAuth state and shop tokens
+// TODO: Replace with Redis or database for production
+const stateStore = new Map();
+const shopStore = new Map();
 
 // Validate critical environment variables on startup
 const validateConfig = () => {
@@ -186,65 +192,94 @@ function isValidShopDomain(shop) {
 }
 
 /**
- * Sanitize error messages for user display
- * @param {Error} error - Error object
- * @returns {string} - Safe error message
+ * Generate secure nonce for OAuth state parameter
  */
-function getSafeErrorMessage(error) {
-  // Don't expose internal error details to users
-  if (error.response?.data?.errors) {
-    return 'Authentication failed. Please try again.';
+function generateNonce() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/**
+ * Save shop data to store
+ */
+function saveShop(shop, accessToken) {
+  shopStore.set(shop, {
+    shop,
+    accessToken,
+    installedAt: new Date().toISOString()
+  });
+  console.log(`✅ Shop saved: ${shop}`);
+}
+
+/**
+ * Get shop data from store
+ */
+function getShop(shop) {
+  return shopStore.get(shop);
+}
+
+/**
+ * Exchange authorization code for access token
+ */
+async function getAccessToken(shop, code) {
+  try {
+    const response = await axios.post(
+      `https://${shop}/admin/oauth/access_token`,
+      {
+        client_id: SHOPIFY_API_KEY,
+        client_secret: SHOPIFY_API_SECRET,
+        code: code
+      }
+    );
+    
+    return response.data.access_token;
+  } catch (error) {
+    console.error('❌ Error getting access token:', error.response?.data || error.message);
+    throw error;
   }
-  return 'An error occurred. Please contact support if this persists.';
+}
+
+/**
+ * Send shop data to Bubble
+ */
+async function sendToBubble(shop, accessToken) {
+  if (!BUBBLE_API_ENDPOINT) {
+    console.warn('⚠️ BUBBLE_API_ENDPOINT not configured');
+    return;
+  }
+
+  try {
+    console.log(`📤 Sending shop data to Bubble: ${shop}`);
+    await axios.post(BUBBLE_API_ENDPOINT, {
+      shop: shop,
+      access_token: accessToken,
+      installed_at: new Date().toISOString()
+    }, {
+      timeout: 30000
+    });
+    console.log('✅ Data sent to Bubble successfully');
+  } catch (error) {
+    console.error('❌ Error sending to Bubble:', error.response?.data || error.message);
+    // Don't throw - we still want OAuth to succeed
+  }
 }
 
 // ===========================================
-// PUBLIC ENDPOINTS
+// OAUTH ROUTES
 // ===========================================
 
 /**
- * Health check endpoint
- * Provides service status without exposing sensitive data
+ * Root endpoint - Main app entry point
+ * This is your "App URL" in Shopify Partner Dashboard
+ * When merchant clicks "Open app", they come here
  */
-app.get('/health', (req, res) => {
-  const health = {
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    service: 'KatiCRM Shopify OAuth Middleware',
-    version: '1.0.0',
-    checks: {
-      shopifySecretConfigured: !!SHOPIFY_API_SECRET,
-      bubbleEndpointConfigured: !!BUBBLE_API_ENDPOINT,
-      gdprWebhooksConfigured: !!(BUBBLE_GDPR_DATA_REQUEST || BUBBLE_GDPR_CUSTOMER_REDACT || BUBBLE_GDPR_SHOP_REDACT)
-    }
-  };
+app.get('/', async (req, res) => {
+  const { shop, hmac } = req.query;
   
-  res.status(200).json(health);
-});
-
-/**
- * Status endpoint for monitoring
- */
-app.get('/status', (req, res) => {
-  res.status(200).json({
-    status: 'ok',
-    service: 'KatiCRM OAuth Middleware',
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      oauth: 'operational',
-      webhooks: 'operational',
-      gdpr: 'enabled'
-    }
-  });
-});
-
-/**
- * Root endpoint - user-friendly landing page
- */
-app.get('/', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html lang="en">
+  // No shop parameter - show info page
+  if (!shop) {
+    return res.send(`
+      <!DOCTYPE html>
+      <html lang="en">
       <head>
         <meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -252,9 +287,7 @@ app.get('/', (req, res) => {
         <style>
           * { margin: 0; padding: 0; box-sizing: border-box; }
           body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-            line-height: 1.6;
-            color: #333;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             min-height: 100vh;
             display: flex;
@@ -264,275 +297,262 @@ app.get('/', (req, res) => {
           }
           .container {
             background: white;
-            border-radius: 12px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 600px;
             padding: 40px;
+            border-radius: 16px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            max-width: 500px;
             text-align: center;
           }
-          h1 { 
-            color: #008060; 
-            margin-bottom: 10px;
-            font-size: 2em;
-          }
-          .subtitle {
-            color: #666;
-            margin-bottom: 30px;
-            font-size: 1.1em;
-          }
-          .status-card { 
-            background: #d4edda; 
-            padding: 20px; 
-            border-radius: 8px; 
-            border: 1px solid #c3e6cb;
-            margin: 20px 0;
-          }
-          .status-card h2 { 
-            color: #155724; 
-            margin: 0 0 15px 0;
-            font-size: 1.3em;
-          }
-          .status-list {
-            list-style: none;
-            text-align: left;
+          .logo { font-size: 48px; margin-bottom: 20px; }
+          h1 { color: #333; margin-bottom: 10px; font-size: 28px; }
+          p { color: #666; line-height: 1.6; margin-bottom: 30px; }
+          .button {
             display: inline-block;
-          }
-          .status-list li {
-            padding: 8px 0;
-            border-bottom: 1px solid rgba(0,0,0,0.05);
-          }
-          .status-list li:last-child {
-            border-bottom: none;
-          }
-          .status-list li::before {
-            content: "✓ ";
-            color: #28a745;
-            font-weight: bold;
-            margin-right: 8px;
-          }
-          .link-button {
-            display: inline-block;
-            background: #008060;
+            background: #5469d4;
             color: white;
-            padding: 12px 24px;
+            padding: 12px 30px;
             border-radius: 6px;
             text-decoration: none;
-            margin: 10px;
-            transition: background 0.3s;
+            font-weight: 600;
+            transition: all 0.3s;
           }
-          .link-button:hover {
-            background: #006e52;
-          }
-          .footer {
-            color: #666;
-            font-size: 0.9em;
-            margin-top: 30px;
-            padding-top: 20px;
-            border-top: 1px solid #eee;
-          }
-          .logo {
-            font-size: 3em;
-            margin-bottom: 10px;
-          }
+          .button:hover { background: #4055c1; transform: translateY(-2px); }
         </style>
       </head>
       <body>
         <div class="container">
           <div class="logo">🛡️</div>
           <h1>KatiCRM</h1>
-          <p class="subtitle">Shopify Integration Service</p>
-          
-          <div class="status-card">
-            <h2>Service Operational</h2>
-            <ul class="status-list">
-              <li>OAuth Authentication Active</li>
-              <li>GDPR Webhooks Configured</li>
-              <li>HMAC Verification Enabled</li>
-              <li>Security Headers Applied</li>
-            </ul>
-          </div>
-          
-          <div>
-            <a href="/health" class="link-button">Health Check</a>
-            <a href="/status" class="link-button">Service Status</a>
-          </div>
-          
-          <div class="footer">
-            <p><strong>For Merchants:</strong></p>
-            <p>Install KatiCRM via the Shopify App Store or your Partner Dashboard</p>
-            <p style="margin-top: 15px; font-size: 0.85em;">
-              This is the authentication middleware for KatiCRM.<br>
-              © ${new Date().getFullYear()} Calltronix - All rights reserved
-            </p>
-          </div>
+          <p>Omni-channel Customer Relationship Management for Shopify</p>
+          <p>This app must be accessed from within your Shopify store admin.</p>
+          <a href="https://apps.shopify.com" class="button">Visit Shopify App Store</a>
         </div>
       </body>
-    </html>
-  `);
-});
-
-// ===========================================
-// OAUTH FLOW
-// ===========================================
-
-/**
- * Initiate OAuth Installation
- * Entry point for merchants to install the app
- */
-app.get('/install', (req, res) => {
-  const shop = req.query.shop;
-  
-  // Validate shop parameter
-  if (!shop) {
-    console.error('Install attempt without shop parameter');
-    return res.status(400).send('Missing shop parameter. Please provide ?shop=your-store.myshopify.com');
+      </html>
+    `);
   }
   
-  // Validate shop domain format
+  // Validate shop format
   if (!isValidShopDomain(shop)) {
-    console.error('Invalid shop domain format:', shop);
-    return res.status(400).send('Invalid shop domain format. Must be: your-store.myshopify.com');
+    return res.status(400).send(`
+      <h1>Invalid Shop Domain</h1>
+      <p>Shop must be in format: your-store.myshopify.com</p>
+    `);
   }
   
-  // Generate secure state parameter for CSRF protection
-  const state = crypto.randomBytes(32).toString('hex');
-  const redirectUri = `${APP_URL}/callback`;
+  // Verify HMAC if present
+  if (hmac && !verifyHmac(req.query, hmac)) {
+    return res.status(403).send('HMAC validation failed');
+  }
   
-  // Build Shopify OAuth URL
-  const installUrl = `https://${shop}/admin/oauth/authorize?` +
-    `client_id=${SHOPIFY_API_KEY}&` +
-    `scope=${SCOPES}&` +
-    `redirect_uri=${encodeURIComponent(redirectUri)}&` +
-    `state=${state}`;
+  // Check if shop is already authenticated
+  const shopData = getShop(shop);
   
-  console.log('✅ Initiating OAuth for shop:', shop);
-  console.log('📍 Redirect URI:', redirectUri);
+  if (shopData && shopData.accessToken) {
+    // Authenticated - redirect to Bubble app
+    console.log(`✅ Authenticated shop accessing app: ${shop}`);
+    const redirectUrl = `${BUBBLE_SUCCESS_URL}?shop=${shop}&token=${shopData.accessToken}`;
+    return res.redirect(redirectUrl);
+  }
   
-  // In production, you should store the state in Redis/database
-  // and validate it in the callback for CSRF protection
+  // Not authenticated - start OAuth
+  console.log(`🔐 Starting OAuth for shop: ${shop}`);
+  
+  const state = generateNonce();
+  const redirectUri = `${APP_URL}/auth/callback`;
+  
+  // Store state for verification
+  stateStore.set(`state_${shop}`, { state, timestamp: Date.now() });
+  
+  const installUrl = 
+    `https://${shop}/admin/oauth/authorize?` +
+    `client_id=${SHOPIFY_API_KEY}` +
+    `&scope=${SCOPES}` +
+    `&redirect_uri=${redirectUri}` +
+    `&state=${state}`;
   
   res.redirect(installUrl);
 });
 
 /**
- * OAuth Callback Handler
- * Receives authorization code from Shopify and exchanges it for access token
+ * OAuth callback endpoint
+ * Shopify redirects here after merchant authorizes
  */
-app.get('/callback', async (req, res) => {
-  const { shop, code, hmac, state } = req.query;
+app.get('/auth/callback', async (req, res) => {
+  const { shop, code, state, hmac } = req.query;
   
-  console.log('📥 Received callback from Shopify');
-  console.log('🏪 Shop:', shop);
-  console.log('🔑 Code received:', code ? 'Yes' : 'No');
+  console.log('🔑 OAuth callback received');
+  console.log('Shop:', shop);
+  console.log('Code present:', !!code);
+  console.log('State present:', !!state);
+  console.log('HMAC present:', !!hmac);
   
   // Validate required parameters
-  if (!shop || !code || !hmac) {
-    console.error('❌ Missing required parameters in callback');
-    const errorUrl = BUBBLE_ERROR_URL || `https://katicrm.com/shopify-connected?success=false&error=missing_parameters`;
-    return res.redirect(errorUrl);
+  if (!shop || !code) {
+    console.error('❌ Missing shop or code');
+    return res.status(400).send('Missing required parameters');
   }
   
-  // Validate shop domain format
+  // Validate shop format
   if (!isValidShopDomain(shop)) {
-    console.error('❌ Invalid shop domain in callback:', shop);
-    const errorUrl = BUBBLE_ERROR_URL || `https://katicrm.com/shopify-connected?success=false&error=invalid_shop`;
-    return res.redirect(errorUrl);
+    console.error('❌ Invalid shop format:', shop);
+    return res.status(400).send('Invalid shop format');
   }
   
-  // Verify HMAC to ensure request is from Shopify
-  if (!verifyHmac(req.query, hmac)) {
-    console.error('❌ HMAC validation failed for shop:', shop);
-    const errorUrl = BUBBLE_ERROR_URL || `https://katicrm.com/shopify-connected?success=false&error=invalid_hmac`;
-    return res.redirect(errorUrl);
+  // Verify HMAC
+  if (!hmac || !verifyHmac(req.query, hmac)) {
+    console.error('❌ HMAC verification failed');
+    return res.status(403).send('HMAC validation failed');
   }
   
-  console.log('✅ HMAC validated successfully');
+  // Verify state (CSRF protection)
+  const stateData = stateStore.get(`state_${shop}`);
+  if (!stateData || state !== stateData.state) {
+    console.error('❌ State validation failed');
+    return res.status(403).send('State validation failed');
+  }
+  
+  // Check state age (should be < 5 minutes)
+  const stateAge = Date.now() - stateData.timestamp;
+  if (stateAge > 5 * 60 * 1000) {
+    console.error('❌ State expired');
+    stateStore.delete(`state_${shop}`);
+    return res.status(403).send('State expired. Please try again.');
+  }
   
   try {
-    console.log('🔄 Exchanging authorization code for access token...');
+    // Exchange code for access token
+    console.log('🔄 Exchanging code for access token...');
+    const accessToken = await getAccessToken(shop, code);
+    console.log('✅ Access token obtained');
     
-    // Exchange authorization code for access token
-    const tokenResponse = await axios.post(
-      `https://${shop}/admin/oauth/access_token`,
-      {
-        client_id: SHOPIFY_API_KEY,
-        client_secret: SHOPIFY_API_SECRET,
-        code: code
-      },
-      {
-        timeout: 10000, // 10 second timeout
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        }
-      }
+    // Save shop data
+    saveShop(shop, accessToken);
+    
+    // Send to Bubble (async, don't block)
+    sendToBubble(shop, accessToken).catch(err => 
+      console.error('Background Bubble sync failed:', err)
     );
     
-    const accessToken = tokenResponse.data.access_token;
-    const scope = tokenResponse.data.scope;
+    // Clean up state
+    stateStore.delete(`state_${shop}`);
     
-    console.log('✅ Access token obtained successfully');
-    console.log('🔐 Granted scopes:', scope);
-    
-    // Store token in Bubble
-    console.log('💾 Sending token to Bubble:', BUBBLE_API_ENDPOINT);
-    
-    await axios.post(
-      BUBBLE_API_ENDPOINT,
-      {
-        shop_domain: shop,
-        access_token: accessToken,
-        scope: scope,
-        connected_at: new Date().toISOString(),
-        app_version: '1.0.0'
-      },
-      {
-        timeout: 10000,
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      }
-    );
-    
-    console.log('✅ Token stored in Bubble successfully');
-    
-    // Redirect to success page
-    const successUrl = BUBBLE_SUCCESS_URL || `https://katicrm.com/shopify-connected?shop=${encodeURIComponent(shop)}&success=true`;
-    res.redirect(successUrl);
+    // Redirect to Bubble app
+    console.log('✅ OAuth complete, redirecting to Bubble app');
+    const redirectUrl = `${BUBBLE_SUCCESS_URL}?shop=${shop}&token=${accessToken}&first_install=true`;
+    res.redirect(redirectUrl);
     
   } catch (error) {
-    console.error('❌ OAuth error:', error.response?.data || error.message);
+    console.error('❌ OAuth callback error:', error);
     
-    // Log detailed error for debugging but send safe message to user
-    if (error.response) {
-      console.error('Response status:', error.response.status);
-      console.error('Response data:', JSON.stringify(error.response.data));
-    }
-    
-    const safeError = getSafeErrorMessage(error);
-    const errorUrl = BUBBLE_ERROR_URL || `https://katicrm.com/shopify-connected?success=false&error=${encodeURIComponent(safeError)}`;
+    // Redirect to error page
+    const errorUrl = `${BUBBLE_ERROR_URL}?error=installation_failed&shop=${shop}`;
     res.redirect(errorUrl);
   }
 });
 
 // ===========================================
-// GDPR COMPLIANCE WEBHOOK ENDPOINTS
+// PUBLIC ENDPOINTS
+// ===========================================
+
+/**
+ * Health check endpoint (for Railway/monitoring)
+ */
+app.get('/health', (req, res) => {
+  res.status(200).json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    service: 'KatiCRM Shopify OAuth Middleware',
+    version: '2.0.0'
+  });
+});
+
+/**
+ * Simple status check (no auth)
+ */
+app.get('/status', (req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    service: 'KatiCRM OAuth Middleware',
+    timestamp: new Date().toISOString()
+  });
+});
+
+// ===========================================
+// ADMIN ENDPOINTS (PROTECTED)
+// ===========================================
+
+/**
+ * Admin authentication middleware
+ */
+function requireAdminAuth(req, res, next) {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || authHeader !== `Bearer ${ADMIN_PASSWORD}`) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  
+  next();
+}
+
+/**
+ * Admin status page (protected)
+ * Access: curl -H "Authorization: Bearer YOUR_PASSWORD" https://your-app.up.railway.app/admin/status
+ */
+app.get('/admin/status', requireAdminAuth, (req, res) => {
+  const shops = Array.from(shopStore.keys());
+  
+  res.json({
+    service: 'KatiCRM OAuth Middleware',
+    status: 'operational',
+    timestamp: new Date().toISOString(),
+    statistics: {
+      connectedShops: shopStore.size,
+      activeStates: stateStore.size
+    },
+    shops: shops,
+    configuration: {
+      oauthEnabled: !!SHOPIFY_API_KEY && !!SHOPIFY_API_SECRET,
+      bubbleConfigured: !!BUBBLE_API_ENDPOINT,
+      gdprWebhooksConfigured: !!(BUBBLE_GDPR_DATA_REQUEST || BUBBLE_GDPR_CUSTOMER_REDACT || BUBBLE_GDPR_SHOP_REDACT)
+    }
+  });
+});
+
+/**
+ * Admin endpoint to check specific shop
+ */
+app.get('/admin/shop/:shop', requireAdminAuth, (req, res) => {
+  const shop = req.params.shop;
+  const shopData = getShop(shop);
+  
+  if (!shopData) {
+    return res.status(404).json({ error: 'Shop not found' });
+  }
+  
+  res.json({
+    shop: shopData.shop,
+    authenticated: true,
+    installedAt: shopData.installedAt
+  });
+});
+
+// ===========================================
+// GDPR WEBHOOKS
 // ===========================================
 
 /**
  * Customer Data Request Webhook
- * Handles GDPR data access requests
+ * Handles GDPR data export requests
  */
 app.post('/webhooks/customers/data_request', async (req, res) => {
   console.log('📋 Customer data request received');
   
   const shop = req.get('X-Shopify-Shop-Domain') || req.get('x-shopify-shop-domain');
   const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
-  const userAgent = req.get('user-agent');
   
   console.log('🏪 Shop:', shop);
   console.log('🔐 HMAC present:', hmac ? 'Yes' : 'No');
-  console.log('🤖 User-Agent:', userAgent);
   
   // Parse body
   const rawBody = req.body;
@@ -565,13 +585,12 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   
   console.log('✅ Webhook HMAC verified successfully');
   
-  // Respond immediately (Shopify requires response within 5 seconds)
-  res.status(200).send('Data request received and will be processed');
+  // Respond immediately
+  res.status(200).send('Customer data request acknowledged');
   
   // Process asynchronously
   setImmediate(async () => {
-    const bubbleEndpoint = BUBBLE_GDPR_DATA_REQUEST || 
-      (BUBBLE_API_ENDPOINT ? BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_data_request') : null);
+    const bubbleEndpoint = BUBBLE_GDPR_DATA_REQUEST;
     
     if (bubbleEndpoint) {
       try {
@@ -645,8 +664,7 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   
   // Process asynchronously
   setImmediate(async () => {
-    const bubbleEndpoint = BUBBLE_GDPR_CUSTOMER_REDACT || 
-      (BUBBLE_API_ENDPOINT ? BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_customer_redact') : null);
+    const bubbleEndpoint = BUBBLE_GDPR_CUSTOMER_REDACT;
     
     if (bubbleEndpoint) {
       try {
@@ -715,19 +733,25 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   
   console.log('✅ Webhook HMAC verified successfully');
   
+  // Remove shop from local store
+  const shopDomain = shop || body.shop_domain;
+  if (shopDomain) {
+    shopStore.delete(shopDomain);
+    console.log(`🗑️ Removed shop from store: ${shopDomain}`);
+  }
+  
   // Respond immediately
   res.status(200).send('Shop data will be redacted');
   
   // Process asynchronously
   setImmediate(async () => {
-    const bubbleEndpoint = BUBBLE_GDPR_SHOP_REDACT || 
-      (BUBBLE_API_ENDPOINT ? BUBBLE_API_ENDPOINT.replace('/store_shopify_token', '/gdpr_shop_redact') : null);
+    const bubbleEndpoint = BUBBLE_GDPR_SHOP_REDACT;
     
     if (bubbleEndpoint) {
       try {
         console.log('📤 Forwarding shop redaction to Bubble:', bubbleEndpoint);
         await axios.post(bubbleEndpoint, {
-          shop: shop || body.shop_domain,
+          shop: shopDomain,
           shop_id: body.shop_id,
           shop_domain: body.shop_domain,
           request_id: body.id,
@@ -815,23 +839,30 @@ process.on('SIGTERM', () => {
 
 // Start server
 const server = app.listen(PORT, () => {
-  console.log('='.repeat(50));
-  console.log('🚀 KatiCRM Shopify OAuth Middleware Started');
-  console.log('='.repeat(50));
+  console.log('');
+  console.log('╔════════════════════════════════════════════════════════════╗');
+  console.log('║  🛡️  KatiCRM Shopify OAuth Middleware v2.0                 ║');
+  console.log('╚════════════════════════════════════════════════════════════╝');
+  console.log('');
   console.log(`📡 Port: ${PORT}`);
   console.log(`🌐 App URL: ${APP_URL}`);
-  console.log(`💚 Health: ${APP_URL}/health`);
-  console.log(`📊 Status: ${APP_URL}/status`);
-  console.log('='.repeat(50));
-  console.log('🔐 Security Features:');
+  console.log(`🔗 OAuth Callback: ${APP_URL}/auth/callback`);
+  console.log(`💚 Health Check: ${APP_URL}/health`);
+  console.log(`🔐 Admin Status: ${APP_URL}/admin/status`);
+  console.log('');
+  console.log('🔒 Security Features:');
   console.log('  ✅ HMAC verification enabled');
+  console.log('  ✅ CSRF protection (state parameter)');
   console.log('  ✅ GDPR webhooks configured');
   console.log('  ✅ Security headers applied');
   console.log('  ✅ Input validation active');
-  console.log('='.repeat(50));
-  console.log(`🔑 Shopify Secret: ${SHOPIFY_API_SECRET ? '✅ Configured' : '❌ NOT configured'}`);
-  console.log(`💾 Bubble Endpoint: ${BUBBLE_API_ENDPOINT ? '✅ Configured' : '❌ NOT configured'}`);
-  console.log('='.repeat(50));
-  console.log('✅ Ready to accept connections');
-  console.log('='.repeat(50));
+  console.log('');
+  console.log('⚙️  Configuration:');
+  console.log(`  🔑 Shopify API Key: ${SHOPIFY_API_KEY ? '✅' : '❌'}`);
+  console.log(`  🔐 Shopify Secret: ${SHOPIFY_API_SECRET ? '✅' : '❌'}`);
+  console.log(`  💾 Bubble Endpoint: ${BUBBLE_API_ENDPOINT ? '✅' : '❌'}`);
+  console.log(`  🎯 Success URL: ${BUBBLE_SUCCESS_URL}`);
+  console.log('');
+  console.log('✅ Ready to accept OAuth requests');
+  console.log('');
 });
