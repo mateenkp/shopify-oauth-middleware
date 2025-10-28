@@ -962,6 +962,7 @@ app.get('/auth/callback', async (req, res) => {
     // Send to Bubble (with retry logic)
     const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
       shop: validatedShop,
+      shop_domain: validatedShop,  // Bubble expects this parameter name
       access_token: accessToken,
       scope: scope,
       installed_at: new Date().toISOString(),
@@ -1194,6 +1195,7 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
       await processWebhookIdempotent(webhookId, async () => {
         const result = await sendToBubble(CONFIG.bubble.gdpr.dataRequest, {
           shop: shop || body.shop_domain,
+          shop_domain: shop || body.shop_domain,  // Bubble expects this
           customer_email: body.customer?.email,
           customer_id: body.customer?.id,
           orders_requested: body.orders_requested,
@@ -1270,6 +1272,7 @@ app.post('/webhooks/customers/redact', async (req, res) => {
       await processWebhookIdempotent(webhookId, async () => {
         const result = await sendToBubble(CONFIG.bubble.gdpr.customerRedact, {
           shop: shop || body.shop_domain,
+          shop_domain: shop || body.shop_domain,  // Bubble expects this
           customer_email: body.customer?.email,
           customer_id: body.customer?.id,
           orders_to_redact: body.orders_to_redact,
@@ -1353,8 +1356,8 @@ app.post('/webhooks/shop/redact', async (req, res) => {
       await processWebhookIdempotent(webhookId, async () => {
         const result = await sendToBubble(CONFIG.bubble.gdpr.shopRedact, {
           shop: shopDomain,
+          shop_domain: shopDomain,  // Bubble expects this
           shop_id: body.shop_id,
-          shop_domain: body.shop_domain,
           request_id: body.id,
           webhook_id: webhookId,
           received_at: new Date().toISOString(),
