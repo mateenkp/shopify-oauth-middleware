@@ -1,22 +1,22 @@
 /**
- * KatiCRM Shopify OAuth Middleware v3.1
+ * KatiCRM Shopify OAuth Middleware v3.2 - STANDALONE APP VERSION
  * 
- * FIXED: Proper OAuth redirect flow for embedded apps
+ * This version is for apps that DO NOT embed in Shopify admin.
+ * Users will access your app directly at your Bubble URL after OAuth.
  * 
- * Production-ready OAuth middleware with:
- * - Rate limiting and DDoS protection
- * - Input validation and sanitization
- * - Structured logging
- * - Redis support for horizontal scaling
- * - Webhook retry mechanism
- * - Health checks with dependency monitoring
- * - Graceful error handling
- * - CORS support
- * - Request timeouts
- * - Idempotency for webhooks
+ * Use this if:
+ * - You want users to access KatiCRM at bubble.io directly
+ * - You don't need Shopify admin integration
+ * - You prefer a standalone web application experience
+ * 
+ * Changes from embedded version:
+ * 1. OAuth redirects directly to your Bubble app
+ * 2. No App Bridge required
+ * 3. Simpler setup, no iframe considerations
+ * 4. Users bookmark/access your Bubble URL directly
  * 
  * @author KatiCRM Team
- * @version 3.1.0
+ * @version 3.2.0
  */
 
 const express = require('express');
@@ -40,7 +40,7 @@ const CONFIG = {
   shopify: {
     apiKey: process.env.SHOPIFY_API_KEY,
     apiSecret: process.env.SHOPIFY_API_SECRET,
-    scopes: process.env.SHOPIFY_SCOPES || 'read_customers,write_customers,read_discounts,write_discounts,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_company_locations,read_fulfillments,write_fulfillments',
+    scopes: process.env.SHOPIFY_SCOPES || 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_discounts,write_discounts,read_company_locations,read_fulfillments,write_fulfillments',
   },
   app: {
     url: process.env.APP_URL,
@@ -48,8 +48,8 @@ const CONFIG = {
   },
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
-    // NEW: This is now just for initial data sync, not for redirects
-    successUrl: process.env.BUBBLE_SUCCESS_URL || 'https://d334.bubble.is/version-test/shopify_dashboard',
+    // For standalone apps, this is where users land after OAuth
+    successUrl: process.env.BUBBLE_SUCCESS_URL || 'https://d334.bubble.io/version-test/shopify_dashboard',
     errorUrl: process.env.BUBBLE_ERROR_URL || 'https://d334.bubble.is/version-test/error',
     gdpr: {
       dataRequest: process.env.BUBBLE_GDPR_DATA_REQUEST,
@@ -127,7 +127,6 @@ const logger = {
 let storage;
 
 if (CONFIG.redis.enabled) {
-  // Production: Use Redis for persistent, distributed storage
   const Redis = require('ioredis');
   const redisClient = new Redis(CONFIG.redis.url, {
     maxRetriesPerRequest: 3,
@@ -162,7 +161,6 @@ if (CONFIG.redis.enabled) {
     },
   };
 } else {
-  // Development: Use in-memory storage
   logger.warn('⚠️  Using in-memory storage. Data will be lost on restart. Configure REDIS_URL for production.');
   
   const memoryStore = new Map();
@@ -187,20 +185,13 @@ if (CONFIG.redis.enabled) {
 // VALIDATION & SANITIZATION
 // ===========================================
 
-/**
- * Validates and sanitizes shop domain input
- * @param {string} shop - Shop domain or handle
- * @returns {object} { valid: boolean, shop: string, error: string }
- */
 function validateShopInput(shop) {
   if (!shop || typeof shop !== 'string') {
     return { valid: false, error: 'Shop parameter is required' };
   }
 
-  // Remove whitespace and convert to lowercase
   shop = shop.trim().toLowerCase();
 
-  // If it's already a full domain
   if (shop.includes('.myshopify.com')) {
     const fullShopRegex = /^[a-z0-9][a-z0-9\-]*\.myshopify\.com$/;
     if (!fullShopRegex.test(shop)) {
@@ -209,7 +200,6 @@ function validateShopInput(shop) {
     return { valid: true, shop };
   }
 
-  // If it's just a handle (e.g., "calltronix")
   const handleRegex = /^[a-z0-9][a-z0-9\-]*$/;
   if (!handleRegex.test(shop)) {
     return { 
@@ -218,28 +208,21 @@ function validateShopInput(shop) {
     };
   }
 
-  // Construct full domain
   const fullShop = `${shop}.myshopify.com`;
   return { valid: true, shop: fullShop };
 }
 
-/**
- * Validates email format
- */
 function isValidEmail(email) {
   if (!email) return false;
   const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
   return emailRegex.test(email);
 }
 
-/**
- * Sanitizes string input to prevent injection
- */
 function sanitizeString(str, maxLength = 255) {
   if (!str) return '';
   return String(str)
     .slice(0, maxLength)
-    .replace(/[<>]/g, '') // Remove potential XSS vectors
+    .replace(/[<>]/g, '')
     .trim();
 }
 
@@ -264,7 +247,6 @@ function validateConfig() {
     process.exit(1);
   }
 
-  // Validate URLs
   try {
     new URL(CONFIG.app.url);
     new URL(CONFIG.bubble.apiEndpoint);
@@ -282,15 +264,13 @@ validateConfig();
 // MIDDLEWARE CONFIGURATION
 // ===========================================
 
-// Trust proxy (required for Railway, Heroku, etc.)
 app.set('trust proxy', 1);
 
-// Helmet for security headers
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      frameAncestors: ["'self'", "https://*.myshopify.com", "https://admin.shopify.com"],
+      // For standalone apps, no need to allow Shopify iframe
     },
   },
   hsts: {
@@ -300,64 +280,54 @@ app.use(helmet({
   },
 }));
 
-// CORS configuration
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (like mobile apps or curl)
     if (!origin) return callback(null, true);
     
-    // Allow Shopify domains
     if (origin.includes('.myshopify.com') || origin.includes('shopify.com')) {
       return callback(null, true);
     }
     
-    // Allow your Bubble app
     if (origin.includes('bubble.io') || origin.includes('bubble.is')) {
       return callback(null, true);
     }
     
-    callback(null, true); // Allow all origins for now, tighten in production
+    callback(null, true);
   },
   credentials: true,
 }));
 
-// Rate limiting - General API
 const generalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // Limit each IP to 100 requests per windowMs
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
 });
 
-// Rate limiting - OAuth (more restrictive)
 const oauthLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20, // Only 20 OAuth attempts per 15 minutes
+  max: 20,
   message: 'Too many authentication attempts, please try again later.',
   skipSuccessfulRequests: true,
 });
 
-// Rate limiting - Webhooks (very permissive)
 const webhookLimiter = rateLimit({
   windowMs: 1 * 60 * 1000,
-  max: 1000, // Shopify can send many webhooks
+  max: 1000,
   message: 'Webhook rate limit exceeded',
 });
 
-// Apply general rate limiting to all routes
 app.use('/auth', oauthLimiter);
 app.use('/webhooks', webhookLimiter);
 app.use(generalLimiter);
 
-// Request ID middleware for tracing
 app.use((req, res, next) => {
   req.id = crypto.randomBytes(16).toString('hex');
   res.setHeader('X-Request-ID', req.id);
   next();
 });
 
-// Request logging
 app.use((req, res, next) => {
   const start = Date.now();
   
@@ -377,16 +347,12 @@ app.use((req, res, next) => {
   next();
 });
 
-// Raw body capture for webhook HMAC verification (BEFORE parsing)
 app.use('/webhooks', express.raw({ type: 'application/json' }));
-
-// JSON parsing for other routes
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Request timeout
 app.use((req, res, next) => {
-  req.setTimeout(30000); // 30 second timeout
+  req.setTimeout(30000);
   res.setTimeout(30000);
   next();
 });
@@ -395,12 +361,6 @@ app.use((req, res, next) => {
 // SECURITY & VERIFICATION FUNCTIONS
 // ===========================================
 
-/**
- * Verify HMAC signature for OAuth callbacks
- * @param {Object} query - Query parameters from OAuth callback
- * @param {string} hmac - HMAC signature to verify
- * @returns {boolean} - True if valid, false otherwise
- */
 function verifyHmac(query, hmac) {
   if (!hmac || !CONFIG.shopify.apiSecret) {
     return false;
@@ -432,12 +392,6 @@ function verifyHmac(query, hmac) {
   }
 }
 
-/**
- * Verify webhook HMAC signature using raw body
- * @param {Buffer|string} rawBody - Raw request body
- * @param {string} hmac - HMAC signature from header
- * @returns {boolean} - True if valid, false otherwise
- */
 function verifyWebhook(rawBody, hmac) {
   if (!hmac || !CONFIG.shopify.apiSecret) {
     return false;
@@ -461,9 +415,6 @@ function verifyWebhook(rawBody, hmac) {
   }
 }
 
-/**
- * Detect if request is from Shopify's automated connectivity test
- */
 function isShopifyConnectivityTest(body, headers) {
   const userAgent = (headers['user-agent'] || '').toLowerCase();
   const hasShopifyUserAgent = userAgent.includes('shopify');
@@ -473,18 +424,12 @@ function isShopifyConnectivityTest(body, headers) {
   return (hasShopifyUserAgent && isMinimalPayload) || looksLikeTest;
 }
 
-/**
- * Generate secure nonce for OAuth state parameter
- */
 function generateNonce() {
   return crypto.randomBytes(32).toString('hex');
 }
 
-/**
- * Check if webhook timestamp is within acceptable range
- */
 function isWebhookTimestampValid(timestamp) {
-  if (!timestamp) return true; // No timestamp provided, skip check
+  if (!timestamp) return true;
   
   try {
     const webhookTime = new Date(timestamp).getTime();
@@ -494,7 +439,7 @@ function isWebhookTimestampValid(timestamp) {
     return age < CONFIG.security.maxWebhookAge;
   } catch (error) {
     logger.warn('Invalid webhook timestamp format', { timestamp });
-    return true; // Don't fail on timestamp parse errors
+    return true;
   }
 }
 
@@ -502,9 +447,6 @@ function isWebhookTimestampValid(timestamp) {
 // DATA PERSISTENCE FUNCTIONS
 // ===========================================
 
-/**
- * Save shop data to storage
- */
 async function saveShop(shop, accessToken, scope) {
   const shopData = {
     shop,
@@ -520,24 +462,15 @@ async function saveShop(shop, accessToken, scope) {
   return shopData;
 }
 
-/**
- * Get shop data from storage
- */
 async function getShop(shop) {
   return await storage.get(`shop:${shop}`);
 }
 
-/**
- * Delete shop data from storage
- */
 async function deleteShop(shop) {
   await storage.delete(`shop:${shop}`);
   logger.info('Shop data deleted', { shop });
 }
 
-/**
- * Save OAuth state for CSRF protection
- */
 async function saveState(shop, state) {
   const stateData = {
     state,
@@ -545,14 +478,10 @@ async function saveState(shop, state) {
     timestamp: Date.now(),
   };
   
-  // Set with expiry (5 minutes)
   await storage.set(`state:${shop}`, stateData, 300);
   logger.debug('OAuth state saved', { shop, state });
 }
 
-/**
- * Verify and consume OAuth state
- */
 async function verifyState(shop, state) {
   const stateData = await storage.get(`state:${shop}`);
   
@@ -566,7 +495,6 @@ async function verifyState(shop, state) {
     return false;
   }
   
-  // Check age
   const age = Date.now() - stateData.timestamp;
   if (age > CONFIG.security.stateExpiryMs) {
     logger.warn('OAuth state expired', { shop, age });
@@ -574,7 +502,6 @@ async function verifyState(shop, state) {
     return false;
   }
   
-  // Consume state (delete after verification)
   await storage.delete(`state:${shop}`);
   logger.debug('OAuth state verified and consumed', { shop });
   
@@ -585,9 +512,6 @@ async function verifyState(shop, state) {
 // SHOPIFY API FUNCTIONS
 // ===========================================
 
-/**
- * Exchange authorization code for access token
- */
 async function getAccessToken(shop, code) {
   try {
     const response = await axios.post(
@@ -617,9 +541,6 @@ async function getAccessToken(shop, code) {
   }
 }
 
-/**
- * Send shop data to Bubble with retry logic
- */
 async function sendToBubble(endpoint, data, retries = 3) {
   if (!endpoint) {
     logger.warn('Bubble endpoint not configured', { data });
@@ -654,7 +575,6 @@ async function sendToBubble(endpoint, data, retries = 3) {
         bubbleError: error.response?.data,
       });
       
-      // Don't retry on 4xx errors (client errors)
       if (error.response?.status >= 400 && error.response?.status < 500) {
         return { 
           success: false, 
@@ -663,7 +583,6 @@ async function sendToBubble(endpoint, data, retries = 3) {
         };
       }
       
-      // Last attempt
       if (attempt === retries) {
         return { 
           success: false, 
@@ -672,7 +591,6 @@ async function sendToBubble(endpoint, data, retries = 3) {
         };
       }
       
-      // Wait before retry (exponential backoff)
       const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
       logger.info(`Retrying in ${delay}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
@@ -684,16 +602,12 @@ async function sendToBubble(endpoint, data, retries = 3) {
 // HEALTH CHECK SYSTEM
 // ===========================================
 
-/**
- * Check if Bubble API is reachable
- */
 async function checkBubbleHealth() {
   if (!CONFIG.bubble.apiEndpoint) {
     return { healthy: false, message: 'Bubble endpoint not configured' };
   }
   
   try {
-    // Try to reach Bubble with a short timeout
     await axios.get(CONFIG.bubble.apiEndpoint.replace('/api/1.1/wf/', ''), {
       timeout: 5000,
     });
@@ -707,9 +621,6 @@ async function checkBubbleHealth() {
   }
 }
 
-/**
- * Check if storage is working
- */
 async function checkStorageHealth() {
   try {
     const testKey = 'health:check';
@@ -733,14 +644,9 @@ async function checkStorageHealth() {
 // OAUTH ROUTES
 // ===========================================
 
-/**
- * Root endpoint - Main app entry point
- * This is your "App URL" in Shopify Partner Dashboard
- */
 app.get('/', async (req, res) => {
   const { shop, hmac } = req.query;
   
-  // No shop parameter - show landing page
   if (!shop) {
     return res.send(`
       <!DOCTYPE html>
@@ -836,8 +742,8 @@ app.get('/', async (req, res) => {
           <p class="subtitle">Omni-channel Customer Relationship Management for Shopify</p>
           
           <div class="info">
-            <p><strong>📱 Connect your Shopify store</strong></p>
-            <p>This app must be accessed from within your Shopify store admin or through the KatiCRM platform.</p>
+            <p><strong>📱 Standalone App Mode</strong></p>
+            <p>This app runs independently outside of Shopify admin. You'll access it directly at your KatiCRM URL after connecting your store.</p>
           </div>
           
           <a href="https://apps.shopify.com" class="button">Visit Shopify App Store</a>
@@ -851,7 +757,6 @@ app.get('/', async (req, res) => {
     `);
   }
   
-  // Validate shop input
   const validation = validateShopInput(shop);
   if (!validation.valid) {
     logger.warn('Invalid shop parameter', { shop, error: validation.error });
@@ -879,20 +784,17 @@ app.get('/', async (req, res) => {
   
   const validatedShop = validation.shop;
   
-  // Verify HMAC if present (when coming from Shopify)
   if (hmac && !verifyHmac(req.query, hmac)) {
     logger.warn('HMAC verification failed on root route', { shop: validatedShop });
     return res.status(403).send('HMAC validation failed');
   }
   
   try {
-    // Always start OAuth flow
     logger.info('Starting OAuth flow', { shop: validatedShop, requestId: req.id });
     
     const state = generateNonce();
     const redirectUri = `${CONFIG.app.url}/auth/callback`;
     
-    // Save state for verification
     await saveState(validatedShop, state);
     
     const installUrl = 
@@ -912,28 +814,27 @@ app.get('/', async (req, res) => {
 });
 
 /**
- * OAuth callback endpoint - FIXED VERSION
- * Shopify redirects here after merchant authorizes
+ * OAuth callback endpoint - STANDALONE APP VERSION
+ * 
+ * For standalone apps, we redirect directly to your Bubble app
+ * Users will access KatiCRM at bubble.io, not embedded in Shopify
  */
 app.get('/auth/callback', async (req, res) => {
-  const { shop, code, state, hmac, host } = req.query;
+  const { shop, code, state, hmac } = req.query;
   
   logger.info('OAuth callback received', { 
     shop, 
     hasCode: !!code, 
     hasState: !!state,
     hasHmac: !!hmac,
-    hasHost: !!host,
     requestId: req.id,
   });
   
-  // Validate required parameters
   if (!shop || !code || !state) {
     logger.error('Missing required OAuth parameters', { shop, code: !!code, state: !!state });
     return res.redirect(`${CONFIG.bubble.errorUrl}?error=missing_parameters`);
   }
   
-  // Validate shop format
   const validation = validateShopInput(shop);
   if (!validation.valid) {
     logger.error('Invalid shop format in callback', { shop, error: validation.error });
@@ -942,13 +843,11 @@ app.get('/auth/callback', async (req, res) => {
   
   const validatedShop = validation.shop;
   
-  // Verify HMAC
   if (!hmac || !verifyHmac(req.query, hmac)) {
     logger.error('HMAC verification failed in callback', { shop: validatedShop });
     return res.redirect(`${CONFIG.bubble.errorUrl}?error=hmac_failed&shop=${validatedShop}`);
   }
   
-  // Verify state (CSRF protection)
   const stateValid = await verifyState(validatedShop, state);
   if (!stateValid) {
     logger.error('State verification failed', { shop: validatedShop, state });
@@ -956,43 +855,44 @@ app.get('/auth/callback', async (req, res) => {
   }
   
   try {
-    // Exchange code for access token
     logger.info('Exchanging authorization code for access token', { shop: validatedShop });
     const { accessToken, scope } = await getAccessToken(validatedShop, code);
     
-    // Save shop data to middleware storage
     await saveShop(validatedShop, accessToken, scope);
     
-    // Send to Bubble asynchronously (don't wait for response)
-    // This is a background sync - we don't want to delay the merchant
+    // Send to Bubble asynchronously
     setImmediate(async () => {
-      const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
-        shop: validatedShop,
-        shop_domain: validatedShop,
-        access_token: accessToken,
-        scope: scope,
-        installed_at: new Date().toISOString(),
-        connected_at: new Date().toISOString(),
-      });
-      
-      if (!bubbleResult.success) {
-        logger.warn('Failed to sync with Bubble (background sync)', { 
+      try {
+        const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
           shop: validatedShop,
-          error: bubbleResult.error,
+          shop_domain: validatedShop,
+          access_token: accessToken,
+          scope: scope,
+          installed_at: new Date().toISOString(),
+          connected_at: new Date().toISOString(),
         });
+        
+        if (!bubbleResult.success) {
+          logger.warn('Failed to sync with Bubble, but OAuth succeeded', { 
+            shop: validatedShop,
+            error: bubbleResult.error,
+          });
+        }
+      } catch (error) {
+        logger.error('Error sending to Bubble after OAuth', error, { shop: validatedShop });
       }
     });
     
-    // FIXED: Redirect to embedded app in Shopify admin
-    // This keeps the merchant inside Shopify admin with KatiCRM embedded
-    const shopifyAdminAppUrl = `https://${validatedShop}/admin/apps/${CONFIG.shopify.apiKey}`;
+    // ==========================================
+    // STANDALONE APP: Redirect directly to Bubble
+    // Users will access your app at bubble.io
+    // ==========================================
+    logger.info('OAuth completed, redirecting to Bubble standalone app', { shop: validatedShop });
     
-    logger.info('OAuth completed - Redirecting to embedded app in Shopify admin', { 
-      shop: validatedShop,
-      redirectUrl: shopifyAdminAppUrl
-    });
+    // Pass shop parameter so Bubble knows which shop connected
+    const redirectUrl = `${CONFIG.bubble.successUrl}?shop=${validatedShop}&first_install=true`;
     
-    res.redirect(shopifyAdminAppUrl);
+    res.redirect(redirectUrl);
     
   } catch (error) {
     logger.error('OAuth callback error', error, { shop: validatedShop });
@@ -1004,13 +904,9 @@ app.get('/auth/callback', async (req, res) => {
 // PUBLIC ENDPOINTS
 // ===========================================
 
-/**
- * Health check endpoint with dependency checks
- */
 app.get('/health', async (req, res) => {
   const startTime = Date.now();
   
-  // Check all dependencies
   const [storageHealth, bubbleHealth] = await Promise.all([
     checkStorageHealth(),
     checkBubbleHealth(),
@@ -1023,7 +919,8 @@ app.get('/health', async (req, res) => {
     status: allHealthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     service: 'KatiCRM Shopify OAuth Middleware',
-    version: '3.1.0',
+    version: '3.2.0 - Standalone',
+    appMode: 'standalone',
     uptime: process.uptime(),
     responseTime: `${Date.now() - startTime}ms`,
     dependencies: {
@@ -1034,9 +931,6 @@ app.get('/health', async (req, res) => {
   });
 });
 
-/**
- * Readiness check (simpler than health check)
- */
 app.get('/ready', (req, res) => {
   res.status(200).json({
     ready: true,
@@ -1044,9 +938,6 @@ app.get('/ready', (req, res) => {
   });
 });
 
-/**
- * Liveness check (even simpler)
- */
 app.get('/ping', (req, res) => {
   res.send('pong');
 });
@@ -1055,9 +946,6 @@ app.get('/ping', (req, res) => {
 // ADMIN ENDPOINTS (PROTECTED)
 // ===========================================
 
-/**
- * Admin authentication middleware
- */
 function requireAdminAuth(req, res, next) {
   const authHeader = req.headers.authorization;
   
@@ -1072,16 +960,14 @@ function requireAdminAuth(req, res, next) {
   next();
 }
 
-/**
- * Admin status dashboard
- */
 app.get('/admin/status', requireAdminAuth, async (req, res) => {
   const storageHealth = await checkStorageHealth();
   const bubbleHealth = await checkBubbleHealth();
   
   res.json({
     service: 'KatiCRM OAuth Middleware',
-    version: '3.1.0',
+    version: '3.2.0',
+    appMode: 'standalone',
     status: 'operational',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
@@ -1103,9 +989,6 @@ app.get('/admin/status', requireAdminAuth, async (req, res) => {
   });
 });
 
-/**
- * Admin endpoint to check specific shop
- */
 app.get('/admin/shop/:shop', requireAdminAuth, async (req, res) => {
   const validation = validateShopInput(req.params.shop);
   
@@ -1119,7 +1002,6 @@ app.get('/admin/shop/:shop', requireAdminAuth, async (req, res) => {
     return res.status(404).json({ error: 'Shop not found' });
   }
   
-  // Don't expose the full access token
   res.json({
     shop: shopData.shop,
     authenticated: true,
@@ -1130,35 +1012,57 @@ app.get('/admin/shop/:shop', requireAdminAuth, async (req, res) => {
   });
 });
 
+// Public API endpoint for Bubble to get shop data
+app.get('/api/shop/:shop', async (req, res) => {
+  const validation = validateShopInput(req.params.shop);
+  
+  if (!validation.valid) {
+    return res.status(400).json({ 
+      error: 'Invalid shop domain',
+      connected: false 
+    });
+  }
+  
+  const shopData = await getShop(validation.shop);
+  
+  if (!shopData) {
+    return res.status(404).json({ 
+      error: 'Shop not found',
+      connected: false 
+    });
+  }
+  
+  // Return shop data for Bubble to use
+  res.json({
+    shop: shopData.shop,
+    connected: true,
+    installed_at: shopData.installedAt,
+    scope: shopData.scope,
+    // Access token stored securely in middleware
+    // Bubble makes API calls through middleware, not directly
+  });
+});
+
 // ===========================================
-// GDPR COMPLIANCE WEBHOOKS
+// GDPR COMPLIANCE WEBHOOKS (Same as before)
 // ===========================================
 
-/**
- * Process webhook with idempotency
- */
 async function processWebhookIdempotent(webhookId, handler) {
   const idempotencyKey = `webhook:processed:${webhookId}`;
   
-  // Check if already processed
   const alreadyProcessed = await storage.exists(idempotencyKey);
   if (alreadyProcessed) {
     logger.info('Webhook already processed (idempotent)', { webhookId });
     return { alreadyProcessed: true };
   }
   
-  // Process webhook
   const result = await handler();
   
-  // Mark as processed (keep for 24 hours)
   await storage.set(idempotencyKey, { processed: true, timestamp: Date.now() }, 86400);
   
   return result;
 }
 
-/**
- * Customer Data Request Webhook (GDPR)
- */
 app.post('/webhooks/customers/data_request', async (req, res) => {
   logger.info('Customer data request webhook received', { requestId: req.id });
   
@@ -1166,7 +1070,6 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
   const timestamp = req.get('X-Shopify-Webhook-Timestamp') || req.get('x-shopify-webhook-timestamp');
   
-  // Parse body
   const rawBody = req.body;
   let body;
   
@@ -1178,19 +1081,16 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
   
-  // Check for connectivity test
   if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
     logger.info('Shopify connectivity test detected');
     return res.status(200).send('Data request webhook is reachable');
   }
   
-  // Verify HMAC
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     logger.error('Webhook HMAC verification failed', { shop, webhookType: 'data_request' });
     return res.status(401).send('Unauthorized: Invalid HMAC signature');
   }
   
-  // Verify timestamp
   if (!isWebhookTimestampValid(timestamp)) {
     logger.warn('Webhook timestamp too old', { shop, timestamp });
     return res.status(401).send('Webhook too old');
@@ -1198,10 +1098,8 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   
   logger.info('Webhook HMAC verified', { shop, webhookType: 'data_request' });
   
-  // Respond immediately (Shopify requires response within 5 seconds)
   res.status(200).send('Customer data request acknowledged');
   
-  // Process asynchronously with idempotency
   setImmediate(async () => {
     try {
       const webhookId = `data_request:${body.shop_id}:${body.id || Date.now()}`;
@@ -1233,9 +1131,6 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
   });
 });
 
-/**
- * Customer Redact Webhook (GDPR)
- */
 app.post('/webhooks/customers/redact', async (req, res) => {
   logger.info('Customer redaction webhook received', { requestId: req.id });
   
@@ -1243,7 +1138,6 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
   const timestamp = req.get('X-Shopify-Webhook-Timestamp') || req.get('x-shopify-webhook-timestamp');
   
-  // Parse body
   const rawBody = req.body;
   let body;
   
@@ -1255,19 +1149,16 @@ app.post('/webhooks/customers/redact', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
   
-  // Check for connectivity test
   if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
     logger.info('Shopify connectivity test detected');
     return res.status(200).send('Customer redact webhook is reachable');
   }
   
-  // Verify HMAC
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     logger.error('Webhook HMAC verification failed', { shop, webhookType: 'customer_redact' });
     return res.status(401).send('Unauthorized: Invalid HMAC signature');
   }
   
-  // Verify timestamp
   if (!isWebhookTimestampValid(timestamp)) {
     logger.warn('Webhook timestamp too old', { shop, timestamp });
     return res.status(401).send('Webhook too old');
@@ -1275,10 +1166,8 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   
   logger.info('Webhook HMAC verified', { shop, webhookType: 'customer_redact' });
   
-  // Respond immediately
   res.status(200).send('Customer data will be redacted');
   
-  // Process asynchronously with idempotency
   setImmediate(async () => {
     try {
       const webhookId = `customer_redact:${body.shop_id}:${body.customer?.id || Date.now()}`;
@@ -1310,9 +1199,6 @@ app.post('/webhooks/customers/redact', async (req, res) => {
   });
 });
 
-/**
- * Shop Redact Webhook (GDPR)
- */
 app.post('/webhooks/shop/redact', async (req, res) => {
   logger.info('Shop redaction webhook received', { requestId: req.id });
   
@@ -1320,7 +1206,6 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   const hmac = req.get('X-Shopify-Hmac-Sha256') || req.get('x-shopify-hmac-sha256');
   const timestamp = req.get('X-Shopify-Webhook-Timestamp') || req.get('x-shopify-webhook-timestamp');
   
-  // Parse body
   const rawBody = req.body;
   let body;
   
@@ -1332,19 +1217,16 @@ app.post('/webhooks/shop/redact', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
   
-  // Check for connectivity test
   if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
     logger.info('Shopify connectivity test detected');
     return res.status(200).send('Shop redact webhook is reachable');
   }
   
-  // Verify HMAC
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     logger.error('Webhook HMAC verification failed', { shop, webhookType: 'shop_redact' });
     return res.status(401).send('Unauthorized: Invalid HMAC signature');
   }
   
-  // Verify timestamp
   if (!isWebhookTimestampValid(timestamp)) {
     logger.warn('Webhook timestamp too old', { shop, timestamp });
     return res.status(401).send('Webhook too old');
@@ -1354,15 +1236,12 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   
   const shopDomain = shop || body.shop_domain;
   
-  // Delete shop from storage
   if (shopDomain) {
     await deleteShop(shopDomain);
   }
   
-  // Respond immediately
   res.status(200).send('Shop data will be redacted');
   
-  // Process asynchronously with idempotency
   setImmediate(async () => {
     try {
       const webhookId = `shop_redact:${body.shop_id}:${Date.now()}`;
@@ -1392,9 +1271,6 @@ app.post('/webhooks/shop/redact', async (req, res) => {
   });
 });
 
-/**
- * Base webhook endpoint (for HMAC test)
- */
 app.post('/webhooks', async (req, res) => {
   logger.info('Base webhook endpoint called', { requestId: req.id });
   
@@ -1420,7 +1296,6 @@ app.post('/webhooks', async (req, res) => {
 // ERROR HANDLING
 // ===========================================
 
-// 404 handler
 app.use((req, res) => {
   logger.warn('404 Not Found', { 
     method: req.method, 
@@ -1435,7 +1310,6 @@ app.use((req, res) => {
   });
 });
 
-// Global error handler
 app.use((err, req, res, next) => {
   logger.error('Unhandled error', err, {
     requestId: req.id,
@@ -1443,7 +1317,6 @@ app.use((err, req, res, next) => {
     path: req.path,
   });
   
-  // Don't expose internal errors to clients
   res.status(500).json({
     error: 'Internal Server Error',
     message: 'An unexpected error occurred',
@@ -1461,7 +1334,6 @@ function gracefulShutdown(signal) {
   server.close(() => {
     logger.info('HTTP server closed');
     
-    // Close database connections, etc.
     if (CONFIG.redis.enabled && redisClient) {
       redisClient.quit(() => {
         logger.info('Redis connection closed');
@@ -1472,7 +1344,6 @@ function gracefulShutdown(signal) {
     }
   });
   
-  // Force shutdown after timeout
   setTimeout(() => {
     logger.error('Could not close connections in time, forcefully shutting down');
     process.exit(1);
@@ -1482,13 +1353,11 @@ function gracefulShutdown(signal) {
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-// Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
   logger.error('Uncaught Exception', error);
   gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
-// Handle unhandled promise rejections
 process.on('unhandledRejection', (reason, promise) => {
   logger.error('Unhandled Rejection', reason, { promise });
 });
@@ -1500,7 +1369,7 @@ process.on('unhandledRejection', (reason, promise) => {
 const server = app.listen(PORT, () => {
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🛡️  KatiCRM Shopify OAuth Middleware v3.1                 ║');
+  console.log('║  🛡️  KatiCRM Shopify OAuth v3.2 - STANDALONE MODE        ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`📡 Server: http://localhost:${PORT}`);
@@ -1508,6 +1377,10 @@ const server = app.listen(PORT, () => {
   console.log(`🔗 OAuth Callback: ${CONFIG.app.url}/auth/callback`);
   console.log(`💚 Health Check: ${CONFIG.app.url}/health`);
   console.log(`🔐 Admin Status: ${CONFIG.app.url}/admin/status`);
+  console.log('');
+  console.log('📱 APP MODE: STANDALONE (Not embedded in Shopify)');
+  console.log('   Users will access KatiCRM directly at Bubble URL');
+  console.log('   No App Bridge or iframe embedding required');
   console.log('');
   console.log('🔒 Security Features:');
   console.log('  ✅ HMAC verification enabled');
@@ -1525,6 +1398,7 @@ const server = app.listen(PORT, () => {
   console.log('  ✅ Request timeouts');
   console.log('  ✅ Retry logic with exponential backoff');
   console.log('  ✅ Structured logging');
+  console.log('  ✅ Async Bubble sync (non-blocking)');
   console.log('');
   console.log('⚙️  Configuration:');
   console.log(`  🔑 Shopify API Key: ${CONFIG.shopify.apiKey ? '✅' : '❌'}`);
@@ -1533,12 +1407,14 @@ const server = app.listen(PORT, () => {
   console.log(`  🗄️  Redis: ${CONFIG.redis.enabled ? '✅ Connected' : '⚠️  Not configured'}`);
   console.log(`  🎯 Environment: ${NODE_ENV}`);
   console.log('');
-  console.log('✅ Server ready to accept requests');
+  console.log('✅ Server ready - Standalone mode active');
   console.log('');
   
   logger.info('Server started successfully', { 
     port: PORT, 
     environment: NODE_ENV,
     redisEnabled: CONFIG.redis.enabled,
+    version: '3.2.0',
+    appMode: 'standalone',
   });
 });
