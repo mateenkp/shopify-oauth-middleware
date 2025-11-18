@@ -1,5 +1,7 @@
 /**
- * KatiCRM Shopify OAuth Middleware v3.0
+ * KatiCRM Shopify OAuth Middleware v3.1
+ * 
+ * FIXED: Proper OAuth redirect flow for embedded apps
  * 
  * Production-ready OAuth middleware with:
  * - Rate limiting and DDoS protection
@@ -14,7 +16,7 @@
  * - Idempotency for webhooks
  * 
  * @author KatiCRM Team
- * @version 3.0.0
+ * @version 3.1.0
  */
 
 const express = require('express');
@@ -38,7 +40,7 @@ const CONFIG = {
   shopify: {
     apiKey: process.env.SHOPIFY_API_KEY,
     apiSecret: process.env.SHOPIFY_API_SECRET,
-    scopes: process.env.SHOPIFY_SCOPES || 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_discounts,write_discounts,read_company_locations,read_fulfillments,write_fulfillments',
+    scopes: process.env.SHOPIFY_SCOPES || 'read_customers,write_customers,read_discounts,write_discounts,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_company_locations,read_fulfillments,write_fulfillments',
   },
   app: {
     url: process.env.APP_URL,
@@ -46,6 +48,7 @@ const CONFIG = {
   },
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
+    // NEW: This is now just for initial data sync, not for redirects
     successUrl: process.env.BUBBLE_SUCCESS_URL || 'https://d334.bubble.is/version-test/shopify_dashboard',
     errorUrl: process.env.BUBBLE_ERROR_URL || 'https://d334.bubble.is/version-test/error',
     gdpr: {
@@ -883,7 +886,7 @@ app.get('/', async (req, res) => {
   }
   
   try {
-    // Always start OAuth flow (removed skip logic for testing)
+    // Always start OAuth flow
     logger.info('Starting OAuth flow', { shop: validatedShop, requestId: req.id });
     
     const state = generateNonce();
@@ -909,17 +912,18 @@ app.get('/', async (req, res) => {
 });
 
 /**
- * OAuth callback endpoint
+ * OAuth callback endpoint - FIXED VERSION
  * Shopify redirects here after merchant authorizes
  */
 app.get('/auth/callback', async (req, res) => {
-  const { shop, code, state, hmac } = req.query;
+  const { shop, code, state, hmac, host } = req.query;
   
   logger.info('OAuth callback received', { 
     shop, 
     hasCode: !!code, 
     hasState: !!state,
     hasHmac: !!hmac,
+    hasHost: !!host,
     requestId: req.id,
   });
   
@@ -956,30 +960,39 @@ app.get('/auth/callback', async (req, res) => {
     logger.info('Exchanging authorization code for access token', { shop: validatedShop });
     const { accessToken, scope } = await getAccessToken(validatedShop, code);
     
-    // Save shop data
+    // Save shop data to middleware storage
     await saveShop(validatedShop, accessToken, scope);
     
-    // Send to Bubble (with retry logic)
-    const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
-      shop: validatedShop,
-      shop_domain: validatedShop,  // Bubble expects this parameter name
-      access_token: accessToken,
-      scope: scope,
-      installed_at: new Date().toISOString(),
-      connected_at: new Date().toISOString(),  // Bubble expects this parameter name
+    // Send to Bubble asynchronously (don't wait for response)
+    // This is a background sync - we don't want to delay the merchant
+    setImmediate(async () => {
+      const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        shop: validatedShop,
+        shop_domain: validatedShop,
+        access_token: accessToken,
+        scope: scope,
+        installed_at: new Date().toISOString(),
+        connected_at: new Date().toISOString(),
+      });
+      
+      if (!bubbleResult.success) {
+        logger.warn('Failed to sync with Bubble (background sync)', { 
+          shop: validatedShop,
+          error: bubbleResult.error,
+        });
+      }
     });
     
-    if (!bubbleResult.success) {
-      logger.warn('Failed to sync with Bubble, but OAuth succeeded', { 
-        shop: validatedShop,
-        error: bubbleResult.error,
-      });
-    }
+    // FIXED: Redirect to embedded app in Shopify admin
+    // This keeps the merchant inside Shopify admin with KatiCRM embedded
+    const shopifyAdminAppUrl = `https://${validatedShop}/admin/apps/${CONFIG.shopify.apiKey}`;
     
-    // Success - redirect to Bubble app
-    logger.info('OAuth flow completed successfully', { shop: validatedShop });
-    const redirectUrl = `${CONFIG.bubble.successUrl}?shop=${validatedShop}&token=${accessToken}&first_install=true`;
-    res.redirect(redirectUrl);
+    logger.info('OAuth completed - Redirecting to embedded app in Shopify admin', { 
+      shop: validatedShop,
+      redirectUrl: shopifyAdminAppUrl
+    });
+    
+    res.redirect(shopifyAdminAppUrl);
     
   } catch (error) {
     logger.error('OAuth callback error', error, { shop: validatedShop });
@@ -1010,7 +1023,7 @@ app.get('/health', async (req, res) => {
     status: allHealthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     service: 'KatiCRM Shopify OAuth Middleware',
-    version: '3.0.0',
+    version: '3.1.0',
     uptime: process.uptime(),
     responseTime: `${Date.now() - startTime}ms`,
     dependencies: {
@@ -1068,7 +1081,7 @@ app.get('/admin/status', requireAdminAuth, async (req, res) => {
   
   res.json({
     service: 'KatiCRM OAuth Middleware',
-    version: '3.0.0',
+    version: '3.1.0',
     status: 'operational',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
@@ -1196,7 +1209,7 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
       await processWebhookIdempotent(webhookId, async () => {
         const result = await sendToBubble(CONFIG.bubble.gdpr.dataRequest, {
           shop: shop || body.shop_domain,
-          shop_domain: shop || body.shop_domain,  // Bubble expects this
+          shop_domain: shop || body.shop_domain,
           customer_email: body.customer?.email,
           customer_id: body.customer?.id,
           orders_requested: body.orders_requested,
@@ -1273,7 +1286,7 @@ app.post('/webhooks/customers/redact', async (req, res) => {
       await processWebhookIdempotent(webhookId, async () => {
         const result = await sendToBubble(CONFIG.bubble.gdpr.customerRedact, {
           shop: shop || body.shop_domain,
-          shop_domain: shop || body.shop_domain,  // Bubble expects this
+          shop_domain: shop || body.shop_domain,
           customer_email: body.customer?.email,
           customer_id: body.customer?.id,
           orders_to_redact: body.orders_to_redact,
@@ -1357,7 +1370,7 @@ app.post('/webhooks/shop/redact', async (req, res) => {
       await processWebhookIdempotent(webhookId, async () => {
         const result = await sendToBubble(CONFIG.bubble.gdpr.shopRedact, {
           shop: shopDomain,
-          shop_domain: shopDomain,  // Bubble expects this
+          shop_domain: shopDomain,
           shop_id: body.shop_id,
           request_id: body.id,
           webhook_id: webhookId,
@@ -1487,7 +1500,7 @@ process.on('unhandledRejection', (reason, promise) => {
 const server = app.listen(PORT, () => {
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🛡️  KatiCRM Shopify OAuth Middleware v3.0                 ║');
+  console.log('║  🛡️  KatiCRM Shopify OAuth Middleware v3.1                 ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`📡 Server: http://localhost:${PORT}`);
