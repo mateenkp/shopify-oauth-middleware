@@ -790,22 +790,14 @@ app.get('/', async (req, res) => {
   }
   
   try {
-    logger.info('Starting OAuth flow', { shop: validatedShop, requestId: req.id });
+    // Simple redirect to KatiCRM connect page
+    // User will manually initiate OAuth from there
+    logger.info('Redirecting to KatiCRM connect page', { shop: validatedShop, requestId: req.id });
     
-    const state = generateNonce();
-    const redirectUri = `${CONFIG.app.url}/auth/callback`;
+    const redirectUrl = `https://katicrm.com/connect_shopify?shop=${validatedShop}&from_install=true`;
     
-    await saveState(validatedShop, state);
-    
-    const installUrl = 
-      `https://${validatedShop}/admin/oauth/authorize?` +
-      `client_id=${CONFIG.shopify.apiKey}` +
-      `&scope=${CONFIG.shopify.scopes}` +
-      `&redirect_uri=${encodeURIComponent(redirectUri)}` +
-      `&state=${state}`;
-    
-    logger.debug('Redirecting to Shopify OAuth', { shop: validatedShop, installUrl });
-    res.redirect(installUrl);
+    logger.debug('Redirecting to KatiCRM', { shop: validatedShop, redirectUrl });
+    res.redirect(redirectUrl);
     
   } catch (error) {
     logger.error('Error in root route', error, { shop: validatedShop });
@@ -884,13 +876,14 @@ app.get('/auth/callback', async (req, res) => {
     });
     
     // ==========================================
-    // STANDALONE APP: Redirect directly to Bubble
-    // Users will access your app at bubble.io
+    // STANDALONE APP: Redirect directly to KatiCRM
+    // Users will access your app at katicrm.com
     // ==========================================
-    logger.info('OAuth completed, redirecting to Bubble standalone app', { shop: validatedShop });
+    logger.info('OAuth completed, redirecting to KatiCRM', { shop: validatedShop });
     
-    // Pass shop parameter so Bubble knows which shop connected
-    const redirectUrl = `${CONFIG.bubble.successUrl}?shop=${validatedShop}&first_install=true`;
+    // Redirect to connect_shopify page with shop parameter
+    // This page will show the connected shop in the table
+    const redirectUrl = `https://katicrm.com/connect_shopify?shop=${validatedShop}&connected=true`;
     
     res.redirect(redirectUrl);
     
