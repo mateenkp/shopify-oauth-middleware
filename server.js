@@ -1,22 +1,15 @@
 /**
- * KatiCRM Shopify OAuth Middleware v3.2 - STANDALONE APP VERSION
+ * KatiCRM Shopify OAuth Middleware v3.3 - STANDALONE APP VERSION
  * 
- * This version is for apps that DO NOT embed in Shopify admin.
- * Users will access your app directly at your Bubble URL after OAuth.
- * 
- * Use this if:
- * - You want users to access KatiCRM at bubble.io directly
- * - You don't need Shopify admin integration
- * - You prefer a standalone web application experience
- * 
- * Changes from embedded version:
- * 1. OAuth redirects directly to your Bubble app
- * 2. No App Bridge required
- * 3. Simpler setup, no iframe considerations
- * 4. Users bookmark/access your Bubble URL directly
+ * OAUTH FLOW (CORRECTED):
+ * 1. User clicks "Connect Shopify" on KatiCRM → /auth/shopify?shop=store.myshopify.com
+ * 2. Middleware redirects to Shopify OAuth screen
+ * 3. User approves → Shopify calls /auth/callback with code
+ * 4. Middleware exchanges code for token
+ * 5. Middleware redirects to KatiCRM success page (shopify_auth)
  * 
  * @author KatiCRM Team
- * @version 3.2.0
+ * @version 3.3.0 - Fixed redirect flow
  */
 
 const express = require('express');
@@ -48,9 +41,9 @@ const CONFIG = {
   },
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
-    // For standalone apps, this is where users land after OAuth
-    successUrl: process.env.BUBBLE_SUCCESS_URL || 'https://d334.bubble.io/version-test/shopify_dashboard',
-    errorUrl: process.env.BUBBLE_ERROR_URL || 'https://d334.bubble.is/version-test/error',
+    // THIS IS WHERE USERS LAND AFTER SUCCESSFUL OAUTH
+    successUrl: process.env.BUBBLE_SUCCESS_URL || 'https://katicrm.com/shopify_auth',
+    errorUrl: process.env.BUBBLE_ERROR_URL || 'https://katicrm.com/shopify_auth',
     gdpr: {
       dataRequest: process.env.BUBBLE_GDPR_DATA_REQUEST,
       customerRedact: process.env.BUBBLE_GDPR_CUSTOMER_REDACT,
@@ -62,7 +55,7 @@ const CONFIG = {
     url: process.env.REDIS_URL,
   },
   security: {
-    stateExpiryMs: 5 * 60 * 1000, // 5 minutes
+    stateExpiryMs: 10 * 60 * 1000, // 10 minutes (increased from 5)
     maxWebhookAge: 5 * 60 * 1000, // 5 minutes
   },
   timeouts: {
@@ -125,10 +118,11 @@ const logger = {
 // ===========================================
 
 let storage;
+let redisClient;
 
 if (CONFIG.redis.enabled) {
   const Redis = require('ioredis');
-  const redisClient = new Redis(CONFIG.redis.url, {
+  redisClient = new Redis(CONFIG.redis.url, {
     maxRetriesPerRequest: 3,
     enableReadyCheck: true,
     retryStrategy(times) {
@@ -192,6 +186,7 @@ function validateShopInput(shop) {
 
   shop = shop.trim().toLowerCase();
 
+  // Already includes .myshopify.com
   if (shop.includes('.myshopify.com')) {
     const fullShopRegex = /^[a-z0-9][a-z0-9\-]*\.myshopify\.com$/;
     if (!fullShopRegex.test(shop)) {
@@ -200,6 +195,7 @@ function validateShopInput(shop) {
     return { valid: true, shop };
   }
 
+  // Just the shop name/handle
   const handleRegex = /^[a-z0-9][a-z0-9\-]*$/;
   if (!handleRegex.test(shop)) {
     return { 
@@ -210,12 +206,6 @@ function validateShopInput(shop) {
 
   const fullShop = `${shop}.myshopify.com`;
   return { valid: true, shop: fullShop };
-}
-
-function isValidEmail(email) {
-  if (!email) return false;
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  return emailRegex.test(email);
 }
 
 function sanitizeString(str, maxLength = 255) {
@@ -270,7 +260,6 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      // For standalone apps, no need to allow Shopify iframe
     },
   },
   hsts: {
@@ -288,7 +277,7 @@ app.use(cors({
       return callback(null, true);
     }
     
-    if (origin.includes('bubble.io') || origin.includes('bubble.is')) {
+    if (origin.includes('bubble.io') || origin.includes('bubble.is') || origin.includes('katicrm.com')) {
       return callback(null, true);
     }
     
@@ -478,7 +467,8 @@ async function saveState(shop, state) {
     timestamp: Date.now(),
   };
   
-  await storage.set(`state:${shop}`, stateData, 300);
+  // Store for 10 minutes (600 seconds)
+  await storage.set(`state:${shop}`, stateData, 600);
   logger.debug('OAuth state saved', { shop, state });
 }
 
@@ -502,6 +492,7 @@ async function verifyState(shop, state) {
     return false;
   }
   
+  // Delete state after verification to prevent reuse
   await storage.delete(`state:${shop}`);
   logger.debug('OAuth state verified and consumed', { shop });
   
@@ -575,6 +566,7 @@ async function sendToBubble(endpoint, data, retries = 3) {
         bubbleError: error.response?.data,
       });
       
+      // Don't retry on 4xx errors (client errors)
       if (error.response?.status >= 400 && error.response?.status < 500) {
         return { 
           success: false, 
@@ -591,6 +583,7 @@ async function sendToBubble(endpoint, data, retries = 3) {
         };
       }
       
+      // Exponential backoff
       const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
       logger.info(`Retrying in ${delay}ms...`);
       await new Promise(resolve => setTimeout(resolve, delay));
@@ -641,9 +634,13 @@ async function checkStorageHealth() {
 }
 
 // ===========================================
-// OAUTH ROUTES
+// OAUTH ROUTES (CORRECTED FLOW)
 // ===========================================
 
+/**
+ * Root route - Shows information page
+ * This is called when users first install the app from Shopify App Store
+ */
 app.get('/', async (req, res) => {
   const { shop, hmac } = req.query;
   
@@ -746,7 +743,7 @@ app.get('/', async (req, res) => {
             <p>This app runs independently outside of Shopify admin. You'll access it directly at your KatiCRM URL after connecting your store.</p>
           </div>
           
-          <a href="https://apps.shopify.com" class="button">Visit Shopify App Store</a>
+          <a href="https://katicrm.com" class="button">Go to KatiCRM</a>
           
           <div class="footer">
             <p>Secure OAuth Integration • GDPR Compliant</p>
@@ -789,27 +786,66 @@ app.get('/', async (req, res) => {
     return res.status(403).send('HMAC validation failed');
   }
   
+  // Redirect to OAuth initiation
+  logger.info('Redirecting to OAuth initiation', { shop: validatedShop });
+  res.redirect(`/auth/shopify?shop=${encodeURIComponent(validatedShop)}`);
+});
+
+/**
+ * OAuth Initiation Endpoint
+ * This is called from KatiCRM when user clicks "Connect Shopify"
+ * It redirects to Shopify's OAuth authorization page
+ */
+app.get('/auth/shopify', async (req, res) => {
+  const { shop } = req.query;
+  
+  logger.info('OAuth initiation requested', { shop, requestId: req.id });
+  
+  if (!shop) {
+    logger.error('Missing shop parameter in OAuth initiation');
+    return res.redirect(`${CONFIG.bubble.errorUrl}?error=missing_shop`);
+  }
+  
+  const validation = validateShopInput(shop);
+  if (!validation.valid) {
+    logger.error('Invalid shop format in OAuth initiation', { shop, error: validation.error });
+    return res.redirect(`${CONFIG.bubble.errorUrl}?error=invalid_shop&message=${encodeURIComponent(validation.error)}`);
+  }
+  
+  const validatedShop = validation.shop;
+  
   try {
-    // Simple redirect to KatiCRM connect page
-    // User will manually initiate OAuth from there
-    logger.info('Redirecting to KatiCRM connect page', { shop: validatedShop, requestId: req.id });
+    // Generate and save state for CSRF protection
+    const state = generateNonce();
+    await saveState(validatedShop, state);
     
-    const redirectUrl = `https://katicrm.com/connect_shopify?shop=${validatedShop}&from_install=true`;
+    // Build Shopify OAuth URL
+    const redirectUri = `${CONFIG.app.url}/auth/callback`;
+    const shopifyAuthUrl = `https://${validatedShop}/admin/oauth/authorize?` + querystring.stringify({
+      client_id: CONFIG.shopify.apiKey,
+      scope: CONFIG.shopify.scopes,
+      redirect_uri: redirectUri,
+      state: state,
+    });
     
-    logger.debug('Redirecting to KatiCRM', { shop: validatedShop, redirectUrl });
-    res.redirect(redirectUrl);
+    logger.info('Redirecting to Shopify OAuth', { 
+      shop: validatedShop, 
+      redirectUri,
+      state,
+    });
+    
+    res.redirect(shopifyAuthUrl);
     
   } catch (error) {
-    logger.error('Error in root route', error, { shop: validatedShop });
-    res.status(500).send('An error occurred. Please try again.');
+    logger.error('Error initiating OAuth', error, { shop: validatedShop });
+    res.redirect(`${CONFIG.bubble.errorUrl}?error=oauth_init_failed&shop=${encodeURIComponent(validatedShop)}`);
   }
 });
 
 /**
- * OAuth callback endpoint - STANDALONE APP VERSION
- * 
- * For standalone apps, we redirect directly to your Bubble app
- * Users will access KatiCRM at bubble.io, not embedded in Shopify
+ * OAuth Callback Endpoint - CORRECTED VERSION
+ * Shopify redirects here after user approves/denies the app
+ * This exchanges the code for an access token and redirects to KatiCRM
  */
 app.get('/auth/callback', async (req, res) => {
   const { shop, code, state, hmac } = req.query;
@@ -822,11 +858,13 @@ app.get('/auth/callback', async (req, res) => {
     requestId: req.id,
   });
   
+  // Validate required parameters
   if (!shop || !code || !state) {
     logger.error('Missing required OAuth parameters', { shop, code: !!code, state: !!state });
     return res.redirect(`${CONFIG.bubble.errorUrl}?error=missing_parameters`);
   }
   
+  // Validate shop format
   const validation = validateShopInput(shop);
   if (!validation.valid) {
     logger.error('Invalid shop format in callback', { shop, error: validation.error });
@@ -835,24 +873,28 @@ app.get('/auth/callback', async (req, res) => {
   
   const validatedShop = validation.shop;
   
+  // Verify HMAC signature
   if (!hmac || !verifyHmac(req.query, hmac)) {
     logger.error('HMAC verification failed in callback', { shop: validatedShop });
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=hmac_failed&shop=${validatedShop}`);
+    return res.redirect(`${CONFIG.bubble.errorUrl}?error=hmac_failed&shop=${encodeURIComponent(validatedShop)}`);
   }
   
+  // Verify state parameter (CSRF protection)
   const stateValid = await verifyState(validatedShop, state);
   if (!stateValid) {
     logger.error('State verification failed', { shop: validatedShop, state });
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=state_failed&shop=${validatedShop}`);
+    return res.redirect(`${CONFIG.bubble.errorUrl}?error=state_failed&shop=${encodeURIComponent(validatedShop)}`);
   }
   
   try {
+    // Exchange authorization code for access token
     logger.info('Exchanging authorization code for access token', { shop: validatedShop });
     const { accessToken, scope } = await getAccessToken(validatedShop, code);
     
+    // Save shop data to storage
     await saveShop(validatedShop, accessToken, scope);
     
-    // Send to Bubble asynchronously
+    // Send installation data to Bubble asynchronously (non-blocking)
     setImmediate(async () => {
       try {
         const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
@@ -862,6 +904,7 @@ app.get('/auth/callback', async (req, res) => {
           scope: scope,
           installed_at: new Date().toISOString(),
           connected_at: new Date().toISOString(),
+          status: 'connected',
         });
         
         if (!bubbleResult.success) {
@@ -869,6 +912,8 @@ app.get('/auth/callback', async (req, res) => {
             shop: validatedShop,
             error: bubbleResult.error,
           });
+        } else {
+          logger.info('Shop data synced to Bubble successfully', { shop: validatedShop });
         }
       } catch (error) {
         logger.error('Error sending to Bubble after OAuth', error, { shop: validatedShop });
@@ -876,20 +921,33 @@ app.get('/auth/callback', async (req, res) => {
     });
     
     // ==========================================
-    // STANDALONE APP: Redirect directly to KatiCRM
-    // Users will access your app at katicrm.com
+    // REDIRECT TO KATICRM SUCCESS PAGE
     // ==========================================
-    logger.info('OAuth completed, redirecting to KatiCRM', { shop: validatedShop });
+    logger.info('OAuth completed successfully, redirecting to KatiCRM', { shop: validatedShop });
     
-    // Redirect to connect_shopify page with shop parameter
-    // This page will show the connected shop in the table
-    const redirectUrl = `https://katicrm.com/connect_shopify?shop=${validatedShop}&connected=true`;
+    // Build success redirect URL
+    const successUrl = new URL(CONFIG.bubble.successUrl);
+    successUrl.searchParams.append('shop', validatedShop);
+    successUrl.searchParams.append('connected', 'true');
+    successUrl.searchParams.append('success', 'true');
     
-    res.redirect(redirectUrl);
+    logger.info('Redirecting to success page', { 
+      shop: validatedShop,
+      redirectUrl: successUrl.toString(),
+    });
+    
+    res.redirect(successUrl.toString());
     
   } catch (error) {
     logger.error('OAuth callback error', error, { shop: validatedShop });
-    res.redirect(`${CONFIG.bubble.errorUrl}?error=installation_failed&shop=${validatedShop}`);
+    
+    // Build error redirect URL
+    const errorUrl = new URL(CONFIG.bubble.errorUrl);
+    errorUrl.searchParams.append('error', 'installation_failed');
+    errorUrl.searchParams.append('shop', encodeURIComponent(validatedShop));
+    errorUrl.searchParams.append('message', encodeURIComponent(error.message));
+    
+    res.redirect(errorUrl.toString());
   }
 });
 
@@ -912,7 +970,7 @@ app.get('/health', async (req, res) => {
     status: allHealthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     service: 'KatiCRM Shopify OAuth Middleware',
-    version: '3.2.0 - Standalone',
+    version: '3.3.0',
     appMode: 'standalone',
     uptime: process.uptime(),
     responseTime: `${Date.now() - startTime}ms`,
@@ -933,6 +991,88 @@ app.get('/ready', (req, res) => {
 
 app.get('/ping', (req, res) => {
   res.send('pong');
+});
+
+// ===========================================
+// API ENDPOINTS FOR BUBBLE
+// ===========================================
+
+/**
+ * Check if a shop is connected
+ * Bubble can call this to verify connection status
+ */
+app.get('/api/shop/:shop', async (req, res) => {
+  const validation = validateShopInput(req.params.shop);
+  
+  if (!validation.valid) {
+    return res.status(400).json({ 
+      error: 'Invalid shop domain',
+      connected: false 
+    });
+  }
+  
+  const shopData = await getShop(validation.shop);
+  
+  if (!shopData) {
+    return res.status(404).json({ 
+      error: 'Shop not found',
+      connected: false,
+      shop: validation.shop,
+    });
+  }
+  
+  // Return shop connection status
+  res.json({
+    shop: shopData.shop,
+    connected: true,
+    installed_at: shopData.installedAt,
+    last_updated: shopData.lastUpdated,
+    scope: shopData.scope,
+    has_token: !!shopData.accessToken,
+  });
+});
+
+/**
+ * Disconnect a shop (revoke connection)
+ * Bubble can call this when user wants to disconnect
+ */
+app.post('/api/shop/:shop/disconnect', async (req, res) => {
+  const validation = validateShopInput(req.params.shop);
+  
+  if (!validation.valid) {
+    return res.status(400).json({ 
+      error: 'Invalid shop domain',
+      success: false,
+    });
+  }
+  
+  const shopData = await getShop(validation.shop);
+  
+  if (!shopData) {
+    return res.status(404).json({ 
+      error: 'Shop not found',
+      success: false,
+    });
+  }
+  
+  try {
+    // Delete shop data from storage
+    await deleteShop(validation.shop);
+    
+    logger.info('Shop disconnected', { shop: validation.shop });
+    
+    res.json({
+      success: true,
+      shop: validation.shop,
+      message: 'Shop disconnected successfully',
+    });
+  } catch (error) {
+    logger.error('Error disconnecting shop', error, { shop: validation.shop });
+    res.status(500).json({
+      error: 'Failed to disconnect shop',
+      success: false,
+    });
+  }
 });
 
 // ===========================================
@@ -959,7 +1099,7 @@ app.get('/admin/status', requireAdminAuth, async (req, res) => {
   
   res.json({
     service: 'KatiCRM OAuth Middleware',
-    version: '3.2.0',
+    version: '3.3.0',
     appMode: 'standalone',
     status: 'operational',
     timestamp: new Date().toISOString(),
@@ -1005,39 +1145,8 @@ app.get('/admin/shop/:shop', requireAdminAuth, async (req, res) => {
   });
 });
 
-// Public API endpoint for Bubble to get shop data
-app.get('/api/shop/:shop', async (req, res) => {
-  const validation = validateShopInput(req.params.shop);
-  
-  if (!validation.valid) {
-    return res.status(400).json({ 
-      error: 'Invalid shop domain',
-      connected: false 
-    });
-  }
-  
-  const shopData = await getShop(validation.shop);
-  
-  if (!shopData) {
-    return res.status(404).json({ 
-      error: 'Shop not found',
-      connected: false 
-    });
-  }
-  
-  // Return shop data for Bubble to use
-  res.json({
-    shop: shopData.shop,
-    connected: true,
-    installed_at: shopData.installedAt,
-    scope: shopData.scope,
-    // Access token stored securely in middleware
-    // Bubble makes API calls through middleware, not directly
-  });
-});
-
 // ===========================================
-// GDPR COMPLIANCE WEBHOOKS (Same as before)
+// GDPR COMPLIANCE WEBHOOKS
 // ===========================================
 
 async function processWebhookIdempotent(webhookId, handler) {
@@ -1051,6 +1160,7 @@ async function processWebhookIdempotent(webhookId, handler) {
   
   const result = await handler();
   
+  // Store for 24 hours
   await storage.set(idempotencyKey, { processed: true, timestamp: Date.now() }, 86400);
   
   return result;
@@ -1362,18 +1472,20 @@ process.on('unhandledRejection', (reason, promise) => {
 const server = app.listen(PORT, () => {
   console.log('');
   console.log('╔════════════════════════════════════════════════════════════╗');
-  console.log('║  🛡️  KatiCRM Shopify OAuth v3.2 - STANDALONE MODE        ║');
+  console.log('║  🛡️  KatiCRM Shopify OAuth v3.3 - STANDALONE MODE        ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`📡 Server: http://localhost:${PORT}`);
   console.log(`🌐 App URL: ${CONFIG.app.url}`);
+  console.log(`🔗 OAuth Init: ${CONFIG.app.url}/auth/shopify`);
   console.log(`🔗 OAuth Callback: ${CONFIG.app.url}/auth/callback`);
+  console.log(`✅ Success Redirect: ${CONFIG.bubble.successUrl}`);
   console.log(`💚 Health Check: ${CONFIG.app.url}/health`);
   console.log(`🔐 Admin Status: ${CONFIG.app.url}/admin/status`);
   console.log('');
   console.log('📱 APP MODE: STANDALONE (Not embedded in Shopify)');
-  console.log('   Users will access KatiCRM directly at Bubble URL');
-  console.log('   No App Bridge or iframe embedding required');
+  console.log('   OAuth Flow: KatiCRM → Shopify → Middleware → KatiCRM');
+  console.log('   Users access KatiCRM directly at katicrm.com');
   console.log('');
   console.log('🔒 Security Features:');
   console.log('  ✅ HMAC verification enabled');
@@ -1407,7 +1519,7 @@ const server = app.listen(PORT, () => {
     port: PORT, 
     environment: NODE_ENV,
     redisEnabled: CONFIG.redis.enabled,
-    version: '3.2.0',
+    version: '3.3.0',
     appMode: 'standalone',
   });
 });
