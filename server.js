@@ -727,6 +727,7 @@ app.get('/', async (req, res) => {
   
   const landingUrl = new URL(CONFIG.bubble.landingUrl);
   landingUrl.searchParams.append('shop', validatedShop);
+  landingUrl.searchParams.append('success', 'false');
   landingUrl.searchParams.append('install', 'true');
   
   res.redirect(landingUrl.toString());
@@ -753,6 +754,7 @@ app.get('/auth/shopify', async (req, res) => {
     
     const landingUrl = new URL(CONFIG.bubble.landingUrl);
     landingUrl.searchParams.append('shop', validatedShop);
+    landingUrl.searchParams.append('success', 'false');
     landingUrl.searchParams.append('install', 'true');
     landingUrl.searchParams.append('message', 'Please log in to connect');
     
