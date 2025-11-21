@@ -749,27 +749,22 @@ app.get('/auth/shopify', async (req, res) => {
   
   const validatedShop = validation.shop;
   
+  // Generate state if not provided (for backward compatibility)
+  let oauthState = state;
   if (!state || state === 'direct_install') {
-    logger.warn('OAuth blocked - no state parameter', { shop: validatedShop });
-    
-    const landingUrl = new URL(CONFIG.bubble.landingUrl);
-    landingUrl.searchParams.append('shop', validatedShop);
-    landingUrl.searchParams.append('success', 'false');
-    landingUrl.searchParams.append('install', 'true');
-    landingUrl.searchParams.append('message', 'Please log in to connect');
-    
-    return res.redirect(landingUrl.toString());
+    logger.warn('OAuth initiated without state parameter - generating one', { shop: validatedShop });
+    oauthState = generateNonce();
   }
   
   try {
-    await saveState(validatedShop, state);
+    await saveState(validatedShop, oauthState);
     
     const redirectUri = `${CONFIG.app.url}/auth/callback`;
     const shopifyAuthUrl = `https://${validatedShop}/admin/oauth/authorize?` + querystring.stringify({
       client_id: CONFIG.shopify.apiKey,
       scope: CONFIG.shopify.scopes,
       redirect_uri: redirectUri,
-      state: state,
+      state: oauthState,
     });
     
     logger.info('Redirecting to Shopify OAuth', { shop: validatedShop });
