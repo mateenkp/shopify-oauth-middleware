@@ -549,6 +549,20 @@ async function sendToBubble(endpoint, data, retries = 3) {
         status: error.response?.status,
       });
       
+      // Treat API Connector parsing errors as warnings, not failures
+      if (error.response?.status === 400 && 
+          error.response?.data?.message?.includes('Error parsing data from Apiconnector')) {
+        logger.warn('Bubble API Connector parsing error - treating as non-fatal', {
+          endpoint,
+          error: error.response?.data?.message,
+        });
+        return { 
+          success: true, 
+          warning: 'API Connector parsing error ignored',
+          partialSuccess: true,
+        };
+      }
+      
       if (error.response?.status >= 400 && error.response?.status < 500) {
         return { 
           success: false, 
@@ -617,7 +631,17 @@ async function checkStorageHealth() {
 // ===========================================
 
 app.get('/', async (req, res) => {
-  const { shop, hmac } = req.query;
+  const { shop, hmac, embedded, host, session, locale, timestamp } = req.query;
+  
+  // Shopify embedded app installation detection
+  const isEmbeddedInstall = embedded === '1' || host;
+  
+  logger.info('Root route accessed', { 
+    shop, 
+    hasHmac: !!hmac,
+    isEmbedded: isEmbeddedInstall,
+    hasHost: !!host,
+  });
   
   if (!shop) {
     return res.send(`
@@ -723,6 +747,35 @@ app.get('/', async (req, res) => {
     return res.status(403).send('HMAC validation failed');
   }
   
+  // Handle embedded app installation from Shopify App Store
+  if (isEmbeddedInstall) {
+    logger.info('Embedded app installation detected, starting OAuth', { 
+      shop: validatedShop,
+      embedded,
+      host,
+    });
+    
+    // For embedded apps, start OAuth immediately with auto-generated state
+    const state = generateNonce();
+    await saveState(validatedShop, state);
+    
+    const redirectUri = `${CONFIG.app.url}/auth/callback`;
+    const shopifyAuthUrl = `https://${validatedShop}/admin/oauth/authorize?` + querystring.stringify({
+      client_id: CONFIG.shopify.apiKey,
+      scope: CONFIG.shopify.scopes,
+      redirect_uri: redirectUri,
+      state: state,
+    });
+    
+    logger.info('Redirecting embedded install to Shopify OAuth', { 
+      shop: validatedShop,
+      redirectUri,
+    });
+    
+    return res.redirect(shopifyAuthUrl);
+  }
+  
+  // For non-embedded installations, redirect to KatiCRM
   logger.info('App installation redirect to KatiCRM', { shop: validatedShop });
   
   const landingUrl = new URL(CONFIG.bubble.landingUrl);
