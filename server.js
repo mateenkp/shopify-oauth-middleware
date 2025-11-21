@@ -1,5 +1,5 @@
 /**
- * KatiCRM Shopify OAuth Middleware v3.4 - STANDALONE APP VERSION
+ * KatiCRM Shopify OAuth Middleware v3.5 - STANDALONE APP VERSION
  * 
  * OAUTH FLOW (CORRECTED - ONLY THROUGH KATICRM):
  * 1. User clicks "Connect Shopify" on KatiCRM → /auth/shopify?shop=store.myshopify.com&state=katicrm_connect
@@ -7,12 +7,18 @@
  * 3. Middleware redirects to Shopify OAuth screen
  * 4. User approves → Shopify calls /auth/callback with code
  * 5. Middleware exchanges code for token
- * 6. Middleware redirects to KatiCRM success page (shopify_auth)
+ * 6. Middleware stores token persistently
+ * 7. Middleware redirects to KatiCRM success page (shopify_auth)
+ * 
+ * TOKEN RETRIEVAL:
+ * - Bubble can query /api/token/:shop to check if token exists
+ * - If token exists, Bubble creates database entry without new OAuth
+ * - Prevents duplicate OAuth flows and improves UX
  * 
  * SECURITY: Direct OAuth attempts without state parameter are redirected to KatiCRM
  * 
  * @author KatiCRM Team
- * @version 3.4.0 - Disabled direct OAuth, only allows OAuth through KatiCRM
+ * @version 3.5.0 - Added token retrieval API and improved storage
  */
 
 const express = require('express');
@@ -61,6 +67,7 @@ const CONFIG = {
     stateExpiryMs: 10 * 60 * 1000,
     maxWebhookAge: 5 * 60 * 1000,
     requireStateParameter: true,
+    tokenExpiryDays: 365, // Tokens don't expire unless store disconnects
   },
   timeouts: {
     axios: 30000,
@@ -157,9 +164,12 @@ if (CONFIG.redis.enabled) {
     async exists(key) {
       return (await redisClient.exists(key)) === 1;
     },
+    async keys(pattern) {
+      return await redisClient.keys(pattern);
+    },
   };
 } else {
-  logger.warn('⚠️  Using in-memory storage');
+  logger.warn('⚠️  Using in-memory storage (tokens will be lost on restart)');
   
   const memoryStore = new Map();
   
@@ -175,6 +185,10 @@ if (CONFIG.redis.enabled) {
     },
     async exists(key) {
       return memoryStore.has(key);
+    },
+    async keys(pattern) {
+      const regex = new RegExp('^' + pattern.replace('*', '.*') + '$');
+      return Array.from(memoryStore.keys()).filter(key => regex.test(key));
     },
   };
 }
@@ -300,8 +314,15 @@ const webhookLimiter = rateLimit({
   message: 'Webhook rate limit exceeded',
 });
 
+const apiLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000,
+  max: 60,
+  message: 'API rate limit exceeded',
+});
+
 app.use('/auth', oauthLimiter);
 app.use('/webhooks', webhookLimiter);
+app.use('/api', apiLimiter);
 app.use(generalLimiter);
 
 app.use((req, res, next) => {
@@ -427,6 +448,10 @@ function isWebhookTimestampValid(timestamp) {
 // DATA PERSISTENCE
 // ===========================================
 
+/**
+ * Save shop data with access token
+ * Enhanced version stores additional metadata for token retrieval
+ */
 async function saveShop(shop, accessToken, scope) {
   const shopData = {
     shop,
@@ -434,23 +459,65 @@ async function saveShop(shop, accessToken, scope) {
     scope,
     installedAt: new Date().toISOString(),
     lastUpdated: new Date().toISOString(),
+    tokenVersion: 1, // For future token rotation
   };
   
   await storage.set(`shop:${shop}`, shopData);
-  logger.info('Shop data saved', { shop });
+  
+  // Create a separate token index for faster lookups
+  await storage.set(`token:${shop}`, {
+    accessToken,
+    createdAt: new Date().toISOString(),
+  });
+  
+  logger.info('Shop data saved with token index', { shop });
   
   return shopData;
 }
 
+/**
+ * Get shop data
+ */
 async function getShop(shop) {
   return await storage.get(`shop:${shop}`);
 }
 
-async function deleteShop(shop) {
-  await storage.delete(`shop:${shop}`);
-  logger.info('Shop data deleted', { shop });
+/**
+ * Get access token for a shop
+ * Optimized lookup using token index
+ */
+async function getAccessTokenForShop(shop) {
+  const tokenData = await storage.get(`token:${shop}`);
+  
+  if (!tokenData) {
+    // Fallback to full shop data if token index doesn't exist
+    const shopData = await getShop(shop);
+    return shopData?.accessToken || null;
+  }
+  
+  return tokenData.accessToken;
 }
 
+/**
+ * Delete shop data and token
+ */
+async function deleteShop(shop) {
+  await storage.delete(`shop:${shop}`);
+  await storage.delete(`token:${shop}`);
+  logger.info('Shop data and token deleted', { shop });
+}
+
+/**
+ * Check if shop has valid token
+ */
+async function hasValidToken(shop) {
+  const token = await getAccessTokenForShop(shop);
+  return !!token;
+}
+
+/**
+ * Save OAuth state
+ */
 async function saveState(shop, state) {
   const stateData = {
     state,
@@ -462,6 +529,9 @@ async function saveState(shop, state) {
   logger.debug('OAuth state saved', { shop, state });
 }
 
+/**
+ * Verify OAuth state
+ */
 async function verifyState(shop, state) {
   const stateData = await storage.get(`state:${shop}`);
   
@@ -860,8 +930,10 @@ app.get('/auth/callback', async (req, res) => {
     logger.info('Exchanging code for token', { shop: validatedShop });
     const { accessToken, scope } = await getAccessToken(validatedShop, code);
     
+    // Save token to Railway storage (primary source of truth)
     await saveShop(validatedShop, accessToken, scope);
     
+    // Send to Bubble asynchronously (secondary backup)
     setImmediate(async () => {
       try {
         const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
@@ -872,6 +944,7 @@ app.get('/auth/callback', async (req, res) => {
           installed_at: new Date().toISOString(),
           connected_at: new Date().toISOString(),
           status: 'connected',
+          source: 'oauth_callback',
         });
         
         if (!bubbleResult.success) {
@@ -888,6 +961,7 @@ app.get('/auth/callback', async (req, res) => {
     successUrl.searchParams.append('shop', validatedShop);
     successUrl.searchParams.append('connected', 'true');
     successUrl.searchParams.append('success', 'true');
+    successUrl.searchParams.append('token_stored', 'true');
     
     res.redirect(successUrl.toString());
     
@@ -918,7 +992,7 @@ app.get('/health', async (req, res) => {
     status: allHealthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
     service: 'KatiCRM OAuth Middleware',
-    version: '3.4.0',
+    version: '3.5.0',
     uptime: process.uptime(),
     dependencies: {
       storage: storageHealth,
@@ -936,7 +1010,121 @@ app.get('/ping', (req, res) => {
 });
 
 // ===========================================
-// API ENDPOINTS
+// TOKEN RETRIEVAL API (NEW)
+// ===========================================
+
+/**
+ * GET /api/token/:shop
+ * 
+ * Check if a shop has an existing access token stored in Railway
+ * This allows Bubble to detect existing connections without triggering new OAuth
+ * 
+ * Returns:
+ * - 200: Token exists and is returned
+ * - 404: No token found for this shop
+ * - 400: Invalid shop parameter
+ */
+app.get('/api/token/:shop', async (req, res) => {
+  const validation = validateShopInput(req.params.shop);
+  
+  if (!validation.valid) {
+    logger.warn('Token lookup - invalid shop', { shop: req.params.shop });
+    return res.status(400).json({ 
+      success: false,
+      error: validation.error,
+      requiresAuth: true,
+    });
+  }
+  
+  const shop = validation.shop;
+  
+  try {
+    const accessToken = await getAccessTokenForShop(shop);
+    
+    if (!accessToken) {
+      logger.info('Token lookup - no token found', { shop });
+      return res.status(404).json({
+        success: false,
+        message: 'No token found for this shop',
+        requiresAuth: true,
+        shop,
+      });
+    }
+    
+    // Get additional shop data
+    const shopData = await getShop(shop);
+    
+    logger.info('Token lookup - token found', { shop });
+    
+    return res.json({
+      success: true,
+      shop,
+      access_token: accessToken,
+      scope: shopData?.scope || CONFIG.shopify.scopes,
+      installed_at: shopData?.installedAt || new Date().toISOString(),
+      last_updated: shopData?.lastUpdated || new Date().toISOString(),
+      source: 'railway_storage',
+      status: 'connected',
+    });
+    
+  } catch (error) {
+    logger.error('Token lookup error', error, { shop });
+    return res.status(500).json({
+      success: false,
+      error: 'Failed to retrieve token',
+      requiresAuth: true,
+    });
+  }
+});
+
+/**
+ * GET /api/token-status/:shop
+ * 
+ * Lightweight endpoint to check if a token exists without returning it
+ * Useful for quick connection status checks
+ */
+app.get('/api/token-status/:shop', async (req, res) => {
+  const validation = validateShopInput(req.params.shop);
+  
+  if (!validation.valid) {
+    return res.status(400).json({ 
+      connected: false,
+      error: validation.error,
+    });
+  }
+  
+  const shop = validation.shop;
+  
+  try {
+    const hasToken = await hasValidToken(shop);
+    
+    if (hasToken) {
+      const shopData = await getShop(shop);
+      return res.json({
+        connected: true,
+        shop,
+        installed_at: shopData?.installedAt,
+        last_updated: shopData?.lastUpdated,
+      });
+    }
+    
+    return res.json({
+      connected: false,
+      shop,
+      requiresAuth: true,
+    });
+    
+  } catch (error) {
+    logger.error('Token status check error', error, { shop });
+    return res.status(500).json({
+      connected: false,
+      error: 'Failed to check token status',
+    });
+  }
+});
+
+// ===========================================
+// SHOP API ENDPOINTS
 // ===========================================
 
 app.get('/api/shop/:shop', async (req, res) => {
@@ -957,6 +1145,7 @@ app.get('/api/shop/:shop', async (req, res) => {
     connected: true,
     installed_at: shopData.installedAt,
     last_updated: shopData.lastUpdated,
+    scope: shopData.scope,
   });
 });
 
@@ -975,6 +1164,20 @@ app.post('/api/shop/:shop/disconnect', async (req, res) => {
   
   try {
     await deleteShop(validation.shop);
+    
+    // Notify Bubble of disconnection
+    setImmediate(async () => {
+      try {
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop: validation.shop,
+          status: 'disconnected',
+          disconnected_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        logger.error('Failed to notify Bubble of disconnection', error);
+      }
+    });
+    
     res.json({ success: true, shop: validation.shop });
   } catch (error) {
     logger.error('Disconnect error', error);
@@ -1000,17 +1203,57 @@ app.get('/admin/status', requireAdminAuth, async (req, res) => {
   const storageHealth = await checkStorageHealth();
   const bubbleHealth = await checkBubbleHealth();
   
+  // Count stored tokens
+  let tokenCount = 0;
+  try {
+    const tokenKeys = await storage.keys('token:*');
+    tokenCount = tokenKeys.length;
+  } catch (error) {
+    logger.error('Failed to count tokens', error);
+  }
+  
   res.json({
     service: 'KatiCRM OAuth Middleware',
-    version: '3.4.0',
+    version: '3.5.0',
     oauthMode: 'katicrm-only',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    statistics: {
+      connectedShops: tokenCount,
+    },
     health: {
       storage: storageHealth,
       bubble: bubbleHealth,
     },
   });
+});
+
+app.get('/admin/shops', requireAdminAuth, async (req, res) => {
+  try {
+    const shopKeys = await storage.keys('shop:*');
+    const shops = [];
+    
+    for (const key of shopKeys) {
+      const shopData = await storage.get(key);
+      if (shopData) {
+        shops.push({
+          shop: shopData.shop,
+          installed_at: shopData.installedAt,
+          last_updated: shopData.lastUpdated,
+          scope: shopData.scope,
+        });
+      }
+    }
+    
+    res.json({
+      success: true,
+      count: shops.length,
+      shops,
+    });
+  } catch (error) {
+    logger.error('Failed to list shops', error);
+    res.status(500).json({ error: 'Failed to retrieve shops' });
+  }
 });
 
 // ===========================================
@@ -1189,17 +1432,24 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 const server = app.listen(PORT, () => {
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════╗');
-  console.log('║  🛡️  KatiCRM OAuth v3.4 - KATICRM ONLY MODE         ║');
+  console.log('║  🛡️  KatiCRM OAuth v3.5 - TOKEN RETRIEVAL ENABLED   ║');
   console.log('╚═══════════════════════════════════════════════════════╝');
   console.log('');
   console.log(`📡 Server: http://localhost:${PORT}`);
   console.log(`🔗 OAuth: ${CONFIG.app.url}/auth/shopify`);
+  console.log(`🔑 Token API: ${CONFIG.app.url}/api/token/:shop`);
   console.log(`✅ Success: ${CONFIG.bubble.successUrl}`);
   console.log(`🏠 Landing: ${CONFIG.bubble.landingUrl}`);
   console.log('');
   console.log('🔒 SECURITY: State parameter REQUIRED');
   console.log('   ✅ Direct OAuth BLOCKED');
   console.log('   ✅ Only KatiCRM button allows OAuth');
+  console.log('');
+  console.log('🆕 NEW FEATURES:');
+  console.log('   ✅ Token retrieval API');
+  console.log('   ✅ Connection status checks');
+  console.log('   ✅ Optimized token storage');
+  console.log('   ✅ Prevents duplicate OAuth flows');
   console.log('');
   console.log('✅ Server ready');
   console.log('');
