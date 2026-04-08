@@ -417,15 +417,6 @@ function verifyWebhook(rawBody, hmac) {
   }
 }
 
-function isShopifyConnectivityTest(body, headers) {
-  const userAgent = (headers['user-agent'] || '').toLowerCase();
-  const hasShopifyUserAgent = userAgent.includes('shopify');
-  const isMinimalPayload = body && Object.keys(body).length <= 3;
-  const looksLikeTest = body && body.shop_id && body.shop_domain && !body.customer;
-  
-  return (hasShopifyUserAgent && isMinimalPayload) || looksLikeTest;
-}
-
 function generateNonce() {
   return crypto.randomBytes(32).toString('hex');
 }
@@ -1411,10 +1402,6 @@ app.post('/webhooks/customers/data_request', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
   
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
-  }
-  
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     return res.status(401).send('Unauthorized');
   }
@@ -1448,10 +1435,6 @@ app.post('/webhooks/customers/redact', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
   
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
-  }
-  
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     return res.status(401).send('Unauthorized');
   }
@@ -1483,10 +1466,6 @@ app.post('/webhooks/shop/redact', async (req, res) => {
     body = JSON.parse(bodyString);
   } catch (error) {
     return res.status(400).send('Invalid JSON');
-  }
-  
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
   }
   
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
@@ -1529,10 +1508,6 @@ app.post('/webhooks/orders/create', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
 
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
-  }
-
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     return res.status(401).send('Unauthorized');
   }
@@ -1570,10 +1545,6 @@ app.post('/webhooks/orders/updated', async (req, res) => {
     body = JSON.parse(bodyString);
   } catch (error) {
     return res.status(400).send('Invalid JSON');
-  }
-
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
   }
 
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
@@ -1614,10 +1585,6 @@ app.post('/webhooks/customers/create', async (req, res) => {
     return res.status(400).send('Invalid JSON');
   }
 
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
-  }
-
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     return res.status(401).send('Unauthorized');
   }
@@ -1654,10 +1621,6 @@ app.post('/webhooks/customers/updated', async (req, res) => {
     body = JSON.parse(bodyString);
   } catch (error) {
     return res.status(400).send('Invalid JSON');
-  }
-
-  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
-    return res.status(200).send('Webhook reachable');
   }
 
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
