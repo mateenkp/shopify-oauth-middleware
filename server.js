@@ -398,18 +398,24 @@ function verifyWebhook(rawBody, hmac) {
   if (!hmac || !CONFIG.shopify.apiSecret) {
     return false;
   }
-  
+
   try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    
+    const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');
+
     const calculatedHmac = crypto
       .createHmac('sha256', CONFIG.shopify.apiSecret)
-      .update(bodyString, 'utf8')
+      .update(body)
       .digest('base64');
-    
+
+    // Compare base64 strings as UTF-8 bytes; trim header value to handle
+    // any trailing whitespace that HTTP proxies may inject
+    const providedHmac = hmac.trim();
+    if (calculatedHmac.length !== providedHmac.length) {
+      return false;
+    }
     return crypto.timingSafeEqual(
-      Buffer.from(calculatedHmac, 'base64'),
-      Buffer.from(hmac, 'base64')
+      Buffer.from(calculatedHmac, 'utf8'),
+      Buffer.from(providedHmac, 'utf8')
     );
   } catch (error) {
     logger.error('Webhook HMAC verification failed', error);
