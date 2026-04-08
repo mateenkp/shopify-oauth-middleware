@@ -656,6 +656,69 @@ async function sendToBubble(endpoint, data, retries = 3) {
 }
 
 // ===========================================
+// SHOPIFY DATA SYNC HELPERS
+// ===========================================
+
+const SHOPIFY_API_VERSION = '2024-01';
+
+async function fetchShopifyData(shop, accessToken) {
+  const base = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}`;
+  const headers = { 'X-Shopify-Access-Token': accessToken };
+
+  try {
+    const [shopInfo, customerCount, orderCount] = await Promise.all([
+      axios.get(`${base}/shop.json`, { headers, timeout: CONFIG.timeouts.axios }),
+      axios.get(`${base}/customers/count.json`, { headers, timeout: CONFIG.timeouts.axios }),
+      axios.get(`${base}/orders/count.json`, { params: { status: 'any' }, headers, timeout: CONFIG.timeouts.axios }),
+    ]);
+
+    return {
+      shop_name: shopInfo.data.shop.name,
+      shop_email: shopInfo.data.shop.email,
+      shop_currency: shopInfo.data.shop.currency,
+      shop_country: shopInfo.data.shop.country_name,
+      shop_timezone: shopInfo.data.shop.iana_timezone,
+      shop_plan: shopInfo.data.shop.plan_name,
+      customer_count: customerCount.data.count,
+      order_count: orderCount.data.count,
+    };
+  } catch (error) {
+    logger.error('Failed to fetch Shopify data', error, { shop });
+    return null;
+  }
+}
+
+async function registerWebhooks(shop, accessToken) {
+  const base = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}`;
+  const headers = { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' };
+  const appUrl = CONFIG.app.url;
+
+  const topics = [
+    { topic: 'orders/create', address: `${appUrl}/webhooks/orders/create` },
+    { topic: 'orders/updated', address: `${appUrl}/webhooks/orders/updated` },
+    { topic: 'customers/create', address: `${appUrl}/webhooks/customers/create` },
+    { topic: 'customers/updated', address: `${appUrl}/webhooks/customers/updated` },
+  ];
+
+  for (const wh of topics) {
+    try {
+      await axios.post(
+        `${base}/webhooks.json`,
+        { webhook: { topic: wh.topic, address: wh.address, format: 'json' } },
+        { headers, timeout: CONFIG.timeouts.axios }
+      );
+      logger.info('Webhook registered', { shop, topic: wh.topic });
+    } catch (error) {
+      if (error.response?.status === 422) {
+        logger.info('Webhook already exists', { shop, topic: wh.topic });
+      } else {
+        logger.error('Failed to register webhook', error, { shop, topic: wh.topic });
+      }
+    }
+  }
+}
+
+// ===========================================
 // HEALTH CHECKS
 // ===========================================
 
@@ -936,6 +999,9 @@ app.get('/auth/callback', async (req, res) => {
     // Send to Bubble asynchronously (secondary backup)
     setImmediate(async () => {
       try {
+        // Fetch real Shopify data to demonstrate API usage and accurate sync
+        const shopifyData = await fetchShopifyData(validatedShop, accessToken);
+
         const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
           shop: validatedShop,
           shop_domain: validatedShop,
@@ -945,11 +1011,15 @@ app.get('/auth/callback', async (req, res) => {
           connected_at: new Date().toISOString(),
           status: 'connected',
           source: 'oauth_callback',
+          ...(shopifyData || {}),
         });
-        
+
         if (!bubbleResult.success) {
           logger.warn('Bubble sync failed', { shop: validatedShop, error: bubbleResult.error });
         }
+
+        // Register order/customer webhooks for ongoing data sync
+        await registerWebhooks(validatedShop, accessToken);
       } catch (error) {
         logger.error('Error sending to Bubble', error, { shop: validatedShop });
       }
@@ -1147,6 +1217,59 @@ app.get('/api/shop/:shop', async (req, res) => {
     last_updated: shopData.lastUpdated,
     scope: shopData.scope,
   });
+});
+
+/**
+ * GET /api/shop/:shop/sync
+ * Fetch live data from Shopify APIs and sync to Bubble.io
+ * Demonstrates real Shopify API usage and accurate data synchronization
+ */
+app.get('/api/shop/:shop/sync', async (req, res) => {
+  const validation = validateShopInput(req.params.shop);
+
+  if (!validation.valid) {
+    return res.status(400).json({ error: 'Invalid shop', success: false });
+  }
+
+  const shop = validation.shop;
+  const accessToken = await getAccessTokenForShop(shop);
+
+  if (!accessToken) {
+    return res.status(404).json({ error: 'Shop not connected', success: false, requiresAuth: true });
+  }
+
+  try {
+    const shopifyData = await fetchShopifyData(shop, accessToken);
+
+    if (!shopifyData) {
+      return res.status(502).json({ error: 'Failed to fetch data from Shopify', success: false });
+    }
+
+    const payload = {
+      shop,
+      ...shopifyData,
+      synced_at: new Date().toISOString(),
+    };
+
+    // Forward to Bubble.io asynchronously
+    setImmediate(async () => {
+      try {
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          ...payload,
+          type: 'sync',
+          source: 'manual_sync',
+        });
+      } catch (error) {
+        logger.error('Failed to sync to Bubble', error, { shop });
+      }
+    });
+
+    logger.info('Shop sync completed', { shop });
+    return res.json({ success: true, ...payload });
+  } catch (error) {
+    logger.error('Sync error', error, { shop });
+    return res.status(500).json({ error: 'Sync failed', success: false });
+  }
 });
 
 app.post('/api/shop/:shop/disconnect', async (req, res) => {
@@ -1385,6 +1508,179 @@ app.post('/webhooks/shop/redact', async (req, res) => {
       });
     } catch (error) {
       logger.error('GDPR webhook error', error);
+    }
+  });
+});
+
+// ===========================================
+// ORDER & CUSTOMER WEBHOOKS
+// ===========================================
+
+app.post('/webhooks/orders/create', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  let body;
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+  } catch (error) {
+    return res.status(400).send('Invalid JSON');
+  }
+
+  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
+    return res.status(200).send('Webhook reachable');
+  }
+
+  if (!hmac || !verifyWebhook(rawBody, hmac)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  res.status(200).send('Acknowledged');
+
+  setImmediate(async () => {
+    try {
+      logger.info('Order created webhook received', { shop, orderId: body.id });
+      await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        type: 'order_created',
+        shop,
+        order_id: body.id,
+        order_name: body.name,
+        total_price: body.total_price,
+        currency: body.currency,
+        customer_email: body.email,
+        created_at: body.created_at,
+        received_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error('Order create webhook error', error, { shop });
+    }
+  });
+});
+
+app.post('/webhooks/orders/updated', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  let body;
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+  } catch (error) {
+    return res.status(400).send('Invalid JSON');
+  }
+
+  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
+    return res.status(200).send('Webhook reachable');
+  }
+
+  if (!hmac || !verifyWebhook(rawBody, hmac)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  res.status(200).send('Acknowledged');
+
+  setImmediate(async () => {
+    try {
+      logger.info('Order updated webhook received', { shop, orderId: body.id });
+      await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        type: 'order_updated',
+        shop,
+        order_id: body.id,
+        order_name: body.name,
+        financial_status: body.financial_status,
+        fulfillment_status: body.fulfillment_status,
+        updated_at: body.updated_at,
+        received_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error('Order updated webhook error', error, { shop });
+    }
+  });
+});
+
+app.post('/webhooks/customers/create', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  let body;
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+  } catch (error) {
+    return res.status(400).send('Invalid JSON');
+  }
+
+  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
+    return res.status(200).send('Webhook reachable');
+  }
+
+  if (!hmac || !verifyWebhook(rawBody, hmac)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  res.status(200).send('Acknowledged');
+
+  setImmediate(async () => {
+    try {
+      logger.info('Customer created webhook received', { shop, customerId: body.id });
+      await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        type: 'customer_created',
+        shop,
+        customer_id: body.id,
+        customer_email: body.email,
+        first_name: body.first_name,
+        last_name: body.last_name,
+        created_at: body.created_at,
+        received_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error('Customer create webhook error', error, { shop });
+    }
+  });
+});
+
+app.post('/webhooks/customers/updated', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  let body;
+  try {
+    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
+    body = JSON.parse(bodyString);
+  } catch (error) {
+    return res.status(400).send('Invalid JSON');
+  }
+
+  if (!hmac && isShopifyConnectivityTest(body, req.headers)) {
+    return res.status(200).send('Webhook reachable');
+  }
+
+  if (!hmac || !verifyWebhook(rawBody, hmac)) {
+    return res.status(401).send('Unauthorized');
+  }
+
+  res.status(200).send('Acknowledged');
+
+  setImmediate(async () => {
+    try {
+      logger.info('Customer updated webhook received', { shop, customerId: body.id });
+      await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        type: 'customer_updated',
+        shop,
+        customer_id: body.id,
+        customer_email: body.email,
+        first_name: body.first_name,
+        last_name: body.last_name,
+        updated_at: body.updated_at,
+        received_at: new Date().toISOString(),
+      });
+    } catch (error) {
+      logger.error('Customer updated webhook error', error, { shop });
     }
   });
 });
