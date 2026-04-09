@@ -327,7 +327,9 @@ function parseWebhookBody(rawBody) {
 // ===========================================
 
 function verifyWebhook(rawBody, hmac) {
-  if (!hmac || !CONFIG.shopify.apiSecret) return false;
+  if (!hmac || !CONFIG.shopify.apiSecret) {
+    return false;
+  }
 
   try {
     const body = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');
@@ -337,9 +339,12 @@ function verifyWebhook(rawBody, hmac) {
       .update(body)
       .digest('base64');
 
+    // Compare base64 strings as UTF-8 bytes; trim header value to handle
+    // any trailing whitespace that HTTP proxies may inject
     const providedHmac = hmac.trim();
-    if (calculatedHmac.length !== providedHmac.length) return false;
-
+    if (calculatedHmac.length !== providedHmac.length) {
+      return false;
+    }
     return crypto.timingSafeEqual(
       Buffer.from(calculatedHmac, 'utf8'),
       Buffer.from(providedHmac, 'utf8')
