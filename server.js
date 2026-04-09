@@ -1,30 +1,27 @@
 /**
- * KatiCRM Shopify OAuth Middleware v3.5 - STANDALONE APP VERSION
- * 
- * OAUTH FLOW (CORRECTED - ONLY THROUGH KATICRM):
- * 1. User clicks "Connect Shopify" on KatiCRM → /auth/shopify?shop=store.myshopify.com&state=katicrm_connect
- * 2. Middleware validates state parameter (blocks direct installs)
- * 3. Middleware redirects to Shopify OAuth screen
- * 4. User approves → Shopify calls /auth/callback with code
- * 5. Middleware exchanges code for token
- * 6. Middleware stores token persistently
- * 7. Middleware redirects to KatiCRM success page (shopify_auth)
- * 
- * TOKEN RETRIEVAL:
- * - Bubble can query /api/token/:shop to check if token exists
- * - If token exists, Bubble creates database entry without new OAuth
- * - Prevents duplicate OAuth flows and improves UX
- * 
- * SECURITY: Direct OAuth attempts without state parameter are redirected to KatiCRM
- * 
+ * KatiCRM Shopify Middleware v4.0 — Session Token + Token Exchange Architecture
+ *
+ * AUTH FLOW (Embedded App / App Bridge):
+ * 1. React app calls App Bridge getSessionToken() → JWT signed with API secret
+ * 2. React app sends JWT to POST /api/shopify/auth
+ * 3. Backend verifies JWT, exchanges for offline access token via Shopify Token Exchange API
+ * 4. Access token stored in Redis/memory; Bubble.io notified in background
+ * 5. Webhooks registered automatically after first token exchange
+ *
+ * 2-WAY SYNC:
+ * Shopify → Bubble: webhooks (orders, customers, products) forwarded to BUBBLE_API_ENDPOINT
+ * Bubble → Shopify: POST /api/shopify/graphql proxies queries & mutations
+ *
  * @author KatiCRM Team
- * @version 3.5.0 - Added token retrieval API and improved storage
+ * @version 4.0.0
  */
+
+'use strict';
 
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
-const querystring = require('querystring');
+const jwt = require('jsonwebtoken');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const cors = require('cors');
@@ -42,32 +39,23 @@ const CONFIG = {
   shopify: {
     apiKey: process.env.SHOPIFY_API_KEY,
     apiSecret: process.env.SHOPIFY_API_SECRET,
-    scopes: process.env.SHOPIFY_SCOPES || 'read_customers,write_customers,read_orders,write_orders,read_products,write_products,read_inventory,write_inventory,read_locations,read_discounts,write_discounts,read_company_locations,read_fulfillments,write_fulfillments',
-  },
-  app: {
-    url: process.env.APP_URL,
-    adminPassword: process.env.ADMIN_PASSWORD || 'change-this-password',
+    apiVersion: '2024-01',
   },
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
-    successUrl: process.env.BUBBLE_SUCCESS_URL || 'https://katicrm.com/version-test/shopify_auth',
-    errorUrl: process.env.BUBBLE_ERROR_URL || 'https://katicrm.com/version-test/shopify_auth',
-    landingUrl: process.env.BUBBLE_LANDING_URL || 'https://katicrm.com/version-test',
     gdpr: {
       dataRequest: process.env.BUBBLE_GDPR_DATA_REQUEST,
       customerRedact: process.env.BUBBLE_GDPR_CUSTOMER_REDACT,
       shopRedact: process.env.BUBBLE_GDPR_SHOP_REDACT,
     },
   },
+  webhookBaseUrl: process.env.WEBHOOK_BASE_URL,
   redis: {
-    enabled: process.env.REDIS_URL ? true : false,
+    enabled: !!process.env.REDIS_URL,
     url: process.env.REDIS_URL,
   },
   security: {
-    stateExpiryMs: 10 * 60 * 1000,
     maxWebhookAge: 5 * 60 * 1000,
-    requireStateParameter: true,
-    tokenExpiryDays: 365, // Tokens don't expire unless store disconnects
   },
   timeouts: {
     axios: 30000,
@@ -170,9 +158,9 @@ if (CONFIG.redis.enabled) {
   };
 } else {
   logger.warn('⚠️  Using in-memory storage (tokens will be lost on restart)');
-  
+
   const memoryStore = new Map();
-  
+
   storage = {
     async set(key, value) {
       memoryStore.set(key, value);
@@ -194,36 +182,6 @@ if (CONFIG.redis.enabled) {
 }
 
 // ===========================================
-// VALIDATION & SANITIZATION
-// ===========================================
-
-function validateShopInput(shop) {
-  if (!shop || typeof shop !== 'string') {
-    return { valid: false, error: 'Shop parameter is required' };
-  }
-
-  shop = shop.trim().toLowerCase();
-
-  if (shop.includes('.myshopify.com')) {
-    const fullShopRegex = /^[a-z0-9][a-z0-9\-]*\.myshopify\.com$/;
-    if (!fullShopRegex.test(shop)) {
-      return { valid: false, error: 'Invalid shop domain format' };
-    }
-    return { valid: true, shop };
-  }
-
-  const handleRegex = /^[a-z0-9][a-z0-9\-]*$/;
-  if (!handleRegex.test(shop)) {
-    return { 
-      valid: false, 
-      error: 'Shop name can only contain lowercase letters, numbers, and hyphens' 
-    };
-  }
-
-  return { valid: true, shop: `${shop}.myshopify.com` };
-}
-
-// ===========================================
 // VALIDATE CONFIGURATION
 // ===========================================
 
@@ -231,24 +189,14 @@ function validateConfig() {
   const required = {
     'SHOPIFY_API_KEY': CONFIG.shopify.apiKey,
     'SHOPIFY_API_SECRET': CONFIG.shopify.apiSecret,
-    'APP_URL': CONFIG.app.url,
-    'BUBBLE_API_ENDPOINT': CONFIG.bubble.apiEndpoint,
   };
-  
+
   const missing = Object.entries(required)
-    .filter(([_, value]) => !value)
+    .filter(([, value]) => !value)
     .map(([key]) => key);
-  
+
   if (missing.length > 0) {
     logger.error('❌ Missing required environment variables', { missing });
-    process.exit(1);
-  }
-
-  try {
-    new URL(CONFIG.app.url);
-    new URL(CONFIG.bubble.apiEndpoint);
-  } catch (error) {
-    logger.error('❌ Invalid URL in configuration', { error });
     process.exit(1);
   }
 
@@ -267,6 +215,7 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
+      frameAncestors: ["'self'", '*.myshopify.com', 'https://admin.shopify.com'],
     },
   },
   hsts: {
@@ -279,15 +228,15 @@ app.use(helmet({
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
-    
-    if (origin.includes('.myshopify.com') || origin.includes('shopify.com')) {
+    if (
+      origin.includes('.myshopify.com') ||
+      origin.includes('shopify.com') ||
+      origin.includes('bubble.io') ||
+      origin.includes('bubble.is') ||
+      origin.includes('katicrm.com')
+    ) {
       return callback(null, true);
     }
-    
-    if (origin.includes('bubble.io') || origin.includes('bubble.is') || origin.includes('katicrm.com')) {
-      return callback(null, true);
-    }
-    
     callback(null, true);
   },
   credentials: true,
@@ -301,9 +250,9 @@ const generalLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-const oauthLimiter = rateLimit({
+const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 20,
+  max: 30,
   message: 'Too many authentication attempts, please try again later.',
   skipSuccessfulRequests: true,
 });
@@ -320,7 +269,7 @@ const apiLimiter = rateLimit({
   message: 'API rate limit exceeded',
 });
 
-app.use('/auth', oauthLimiter);
+app.use('/api', authLimiter);
 app.use('/webhooks', webhookLimiter);
 app.use('/api', apiLimiter);
 app.use(generalLimiter);
@@ -333,7 +282,6 @@ app.use((req, res, next) => {
 
 app.use((req, res, next) => {
   const start = Date.now();
-  
   res.on('finish', () => {
     const duration = Date.now() - start;
     logger.info('Request completed', {
@@ -345,10 +293,10 @@ app.use((req, res, next) => {
       ip: req.ip,
     });
   });
-  
   next();
 });
 
+// IMPORTANT: raw body for webhooks (HMAC requires raw bytes) MUST come before express.json()
 app.use('/webhooks', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -360,39 +308,23 @@ app.use((req, res, next) => {
 });
 
 // ===========================================
-// SECURITY FUNCTIONS
+// WEBHOOK BODY HELPER
 // ===========================================
 
-function verifyHmac(query, hmac) {
-  if (!hmac || !CONFIG.shopify.apiSecret) {
-    return false;
-  }
-  
+function parseWebhookBody(rawBody) {
   try {
-    const params = Object.keys(query)
-      .filter(key => key !== 'hmac' && key !== 'signature')
-      .sort()
-      .reduce((acc, key) => {
-        acc[key] = query[key];
-        return acc;
-      }, {});
-    
-    const message = querystring.stringify(params);
-    
-    const hash = crypto
-      .createHmac('sha256', CONFIG.shopify.apiSecret)
-      .update(message)
-      .digest('hex');
-      
-    return crypto.timingSafeEqual(
-      Buffer.from(hash),
-      Buffer.from(hmac)
-    );
-  } catch (error) {
-    logger.error('HMAC verification failed', error);
-    return false;
+    return {
+      ok: true,
+      body: JSON.parse(Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : String(rawBody)),
+    };
+  } catch {
+    return { ok: false };
   }
 }
+
+// ===========================================
+// WEBHOOK HMAC VERIFICATION
+// ===========================================
 
 function verifyWebhook(rawBody, hmac) {
   if (!hmac || !CONFIG.shopify.apiSecret) {
@@ -423,32 +355,72 @@ function verifyWebhook(rawBody, hmac) {
   }
 }
 
-function generateNonce() {
-  return crypto.randomBytes(32).toString('hex');
-}
-
 function isWebhookTimestampValid(timestamp) {
   if (!timestamp) return true;
-  
   try {
-    const webhookTime = new Date(timestamp).getTime();
-    const now = Date.now();
-    const age = now - webhookTime;
-    
+    const age = Date.now() - new Date(timestamp).getTime();
     return age < CONFIG.security.maxWebhookAge;
-  } catch (error) {
+  } catch {
     return true;
   }
+}
+
+// ===========================================
+// SESSION TOKEN VERIFICATION
+// ===========================================
+
+function verifySessionToken(token) {
+  if (!token) return { valid: false, error: 'No token provided' };
+
+  try {
+    const payload = jwt.verify(token, CONFIG.shopify.apiSecret, {
+      algorithms: ['HS256'],
+      audience: CONFIG.shopify.apiKey,
+    });
+
+    if (!payload.dest) return { valid: false, error: 'Missing dest claim' };
+
+    const shopHost = new URL(payload.dest).hostname;
+    if (!shopHost.endsWith('.myshopify.com')) {
+      return { valid: false, error: 'Invalid shop domain' };
+    }
+
+    if (!payload.iss?.includes(shopHost)) {
+      return { valid: false, error: 'Issuer mismatch' };
+    }
+
+    return { valid: true, payload, shop: shopHost };
+  } catch (err) {
+    return {
+      valid: false,
+      error: err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid token',
+    };
+  }
+}
+
+function requireSessionToken(req, res, next) {
+  const auth = req.headers.authorization;
+  if (!auth?.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Unauthorized', detail: 'Missing token' });
+  }
+
+  const token = auth.slice(7);
+  const result = verifySessionToken(token);
+
+  if (!result.valid) {
+    return res.status(401).json({ error: 'Unauthorized', detail: result.error });
+  }
+
+  req.shopifyShop = result.shop;
+  req.shopifyToken = token;
+  req.shopifyPayload = result.payload;
+  next();
 }
 
 // ===========================================
 // DATA PERSISTENCE
 // ===========================================
 
-/**
- * Save shop data with access token
- * Enhanced version stores additional metadata for token retrieval
- */
 async function saveShop(shop, accessToken, scope) {
   const shopData = {
     shop,
@@ -456,133 +428,122 @@ async function saveShop(shop, accessToken, scope) {
     scope,
     installedAt: new Date().toISOString(),
     lastUpdated: new Date().toISOString(),
-    tokenVersion: 1, // For future token rotation
+    tokenVersion: 1,
   };
-  
+
   await storage.set(`shop:${shop}`, shopData);
-  
-  // Create a separate token index for faster lookups
-  await storage.set(`token:${shop}`, {
-    accessToken,
-    createdAt: new Date().toISOString(),
-  });
-  
-  logger.info('Shop data saved with token index', { shop });
-  
+  await storage.set(`token:${shop}`, { accessToken, createdAt: new Date().toISOString() });
+
+  logger.info('Shop data saved', { shop });
   return shopData;
 }
 
-/**
- * Get shop data
- */
 async function getShop(shop) {
   return await storage.get(`shop:${shop}`);
 }
 
-/**
- * Get access token for a shop
- * Optimized lookup using token index
- */
 async function getAccessTokenForShop(shop) {
   const tokenData = await storage.get(`token:${shop}`);
-  
   if (!tokenData) {
-    // Fallback to full shop data if token index doesn't exist
     const shopData = await getShop(shop);
     return shopData?.accessToken || null;
   }
-  
   return tokenData.accessToken;
 }
 
-/**
- * Delete shop data and token
- */
 async function deleteShop(shop) {
   await storage.delete(`shop:${shop}`);
   await storage.delete(`token:${shop}`);
-  logger.info('Shop data and token deleted', { shop });
+  logger.info('Shop data deleted', { shop });
 }
 
-/**
- * Check if shop has valid token
- */
 async function hasValidToken(shop) {
-  const token = await getAccessTokenForShop(shop);
-  return !!token;
+  return !!(await getAccessTokenForShop(shop));
 }
 
-/**
- * Save OAuth state
- */
-async function saveState(shop, state) {
-  const stateData = {
-    state,
-    shop,
-    timestamp: Date.now(),
-  };
-  
-  await storage.set(`state:${shop}`, stateData, 600);
-  logger.debug('OAuth state saved', { shop, state });
-}
+// ===========================================
+// IDEMPOTENT WEBHOOK PROCESSING
+// ===========================================
 
-/**
- * Verify OAuth state
- */
-async function verifyState(shop, state) {
-  const stateData = await storage.get(`state:${shop}`);
-  
-  if (!stateData) {
-    logger.warn('OAuth state not found', { shop });
-    return false;
+async function processWebhookIdempotent(webhookId, handler) {
+  const key = `webhook:processed:${webhookId}`;
+
+  if (await storage.exists(key)) {
+    logger.info('Webhook already processed', { webhookId });
+    return { alreadyProcessed: true };
   }
-  
-  if (stateData.state !== state) {
-    logger.warn('OAuth state mismatch', { shop });
-    return false;
-  }
-  
-  const age = Date.now() - stateData.timestamp;
-  if (age > CONFIG.security.stateExpiryMs) {
-    logger.warn('OAuth state expired', { shop });
-    await storage.delete(`state:${shop}`);
-    return false;
-  }
-  
-  await storage.delete(`state:${shop}`);
-  logger.debug('OAuth state verified', { shop });
-  
-  return true;
+
+  const result = await handler();
+  await storage.set(key, { processed: true }, 86400);
+  return result;
 }
 
 // ===========================================
 // SHOPIFY API FUNCTIONS
 // ===========================================
 
-async function getAccessToken(shop, code) {
-  try {
-    const response = await axios.post(
-      `https://${shop}/admin/oauth/access_token`,
-      {
-        client_id: CONFIG.shopify.apiKey,
-        client_secret: CONFIG.shopify.apiSecret,
-        code,
-      },
-      {
-        timeout: CONFIG.timeouts.axios,
+async function exchangeTokenForOfflineToken(shop, sessionToken) {
+  const response = await axios.post(
+    `https://${shop}/admin/oauth/access_token`,
+    {
+      client_id: CONFIG.shopify.apiKey,
+      client_secret: CONFIG.shopify.apiSecret,
+      grant_type: 'urn:ietf:params:oauth:grant-type:token-exchange',
+      subject_token: sessionToken,
+      subject_token_type: 'urn:ietf:params:oauth:token-type:id_token',
+      requested_token_type: 'urn:shopify:params:oauth:token-type:offline-access-token',
+    },
+    { timeout: CONFIG.timeouts.axios }
+  );
+  return {
+    accessToken: response.data.access_token,
+    scope: response.data.scope,
+  };
+}
+
+async function registerWebhooks(shop, accessToken) {
+  if (!CONFIG.webhookBaseUrl) {
+    logger.warn('WEBHOOK_BASE_URL not set — skipping webhook registration', { shop });
+    return;
+  }
+
+  const base = `https://${shop}/admin/api/${CONFIG.shopify.apiVersion}`;
+  const headers = {
+    'X-Shopify-Access-Token': accessToken,
+    'Content-Type': 'application/json',
+  };
+
+  const topics = [
+    'orders/create',
+    'orders/updated',
+    'customers/create',
+    'customers/updated',
+    'products/update',
+    'app/uninstalled',
+  ];
+
+  for (const topic of topics) {
+    const address = `${CONFIG.webhookBaseUrl}/webhooks/${topic}`;
+    try {
+      await axios.post(
+        `${base}/webhooks.json`,
+        { webhook: { topic, address, format: 'json' } },
+        { headers, timeout: CONFIG.timeouts.axios }
+      );
+      logger.info('Webhook registered', { shop, topic });
+    } catch (error) {
+      if (error.response?.status === 422) {
+        logger.info('Webhook already exists', { shop, topic });
+      } else {
+        logger.error('Failed to register webhook', error, { shop, topic });
       }
-    );
-    
-    logger.info('Access token obtained', { shop });
-    return {
-      accessToken: response.data.access_token,
-      scope: response.data.scope,
-    };
-  } catch (error) {
-    logger.error('Failed to get access token', error, { shop });
-    throw new Error('Failed to obtain access token from Shopify');
+    }
   }
 }
+
+// ===========================================
+// BUBBLE.IO INTEGRATION
+// ===========================================
 
 async function sendToBubble(endpoint, data, retries = 3) {
   if (!endpoint) {
@@ -592,125 +553,43 @@ async function sendToBubble(endpoint, data, retries = 3) {
 
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      logger.info(`Sending data to Bubble (attempt ${attempt}/${retries})`, { 
-        endpoint, 
+      logger.info(`Sending data to Bubble (attempt ${attempt}/${retries})`, {
+        endpoint,
         dataKeys: Object.keys(data),
       });
-      
+
       const response = await axios.post(endpoint, data, {
         timeout: CONFIG.timeouts.axios,
-        headers: {
-          'Content-Type': 'application/json',
-        },
+        headers: { 'Content-Type': 'application/json' },
       });
-      
-      logger.info('Data sent to Bubble successfully', { 
-        endpoint,
-        status: response.status,
-      });
-      
+
+      logger.info('Data sent to Bubble successfully', { endpoint, status: response.status });
       return { success: true, response: response.data };
     } catch (error) {
       logger.error(`Bubble request failed (attempt ${attempt}/${retries})`, error, {
         endpoint,
         status: error.response?.status,
       });
-      
-      // Treat API Connector parsing errors as warnings, not failures
-      if (error.response?.status === 400 && 
-          error.response?.data?.message?.includes('Error parsing data from Apiconnector')) {
-        logger.warn('Bubble API Connector parsing error - treating as non-fatal', {
-          endpoint,
-          error: error.response?.data?.message,
-        });
-        return { 
-          success: true, 
-          warning: 'API Connector parsing error ignored',
-          partialSuccess: true,
-        };
+
+      // Treat Bubble API Connector parsing errors as non-fatal
+      if (
+        error.response?.status === 400 &&
+        error.response?.data?.message?.includes('Error parsing data from Apiconnector')
+      ) {
+        logger.warn('Bubble API Connector parsing error — treating as non-fatal', { endpoint });
+        return { success: true, warning: 'API Connector parsing error ignored', partialSuccess: true };
       }
-      
+
       if (error.response?.status >= 400 && error.response?.status < 500) {
-        return { 
-          success: false, 
-          error: `Bubble returned ${error.response.status}`,
-          permanent: true,
-        };
+        return { success: false, error: `Bubble returned ${error.response.status}`, permanent: true };
       }
-      
+
       if (attempt === retries) {
-        return { 
-          success: false, 
-          error: error.message,
-          attempts: retries,
-        };
+        return { success: false, error: error.message, attempts: retries };
       }
-      
+
       const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
       await new Promise(resolve => setTimeout(resolve, delay));
-    }
-  }
-}
-
-// ===========================================
-// SHOPIFY DATA SYNC HELPERS
-// ===========================================
-
-const SHOPIFY_API_VERSION = '2024-01';
-
-async function fetchShopifyData(shop, accessToken) {
-  const base = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}`;
-  const headers = { 'X-Shopify-Access-Token': accessToken };
-
-  try {
-    const [shopInfo, customerCount, orderCount] = await Promise.all([
-      axios.get(`${base}/shop.json`, { headers, timeout: CONFIG.timeouts.axios }),
-      axios.get(`${base}/customers/count.json`, { headers, timeout: CONFIG.timeouts.axios }),
-      axios.get(`${base}/orders/count.json`, { params: { status: 'any' }, headers, timeout: CONFIG.timeouts.axios }),
-    ]);
-
-    return {
-      shop_name: shopInfo.data.shop.name,
-      shop_email: shopInfo.data.shop.email,
-      shop_currency: shopInfo.data.shop.currency,
-      shop_country: shopInfo.data.shop.country_name,
-      shop_timezone: shopInfo.data.shop.iana_timezone,
-      shop_plan: shopInfo.data.shop.plan_name,
-      customer_count: customerCount.data.count,
-      order_count: orderCount.data.count,
-    };
-  } catch (error) {
-    logger.error('Failed to fetch Shopify data', error, { shop });
-    return null;
-  }
-}
-
-async function registerWebhooks(shop, accessToken) {
-  const base = `https://${shop}/admin/api/${SHOPIFY_API_VERSION}`;
-  const headers = { 'X-Shopify-Access-Token': accessToken, 'Content-Type': 'application/json' };
-  const appUrl = CONFIG.app.url;
-
-  const topics = [
-    { topic: 'orders/create', address: `${appUrl}/webhooks/orders/create` },
-    { topic: 'orders/updated', address: `${appUrl}/webhooks/orders/updated` },
-    { topic: 'customers/create', address: `${appUrl}/webhooks/customers/create` },
-    { topic: 'customers/updated', address: `${appUrl}/webhooks/customers/updated` },
-  ];
-
-  for (const wh of topics) {
-    try {
-      await axios.post(
-        `${base}/webhooks.json`,
-        { webhook: { topic: wh.topic, address: wh.address, format: 'json' } },
-        { headers, timeout: CONFIG.timeouts.axios }
-      );
-      logger.info('Webhook registered', { shop, topic: wh.topic });
-    } catch (error) {
-      if (error.response?.status === 422) {
-        logger.info('Webhook already exists', { shop, topic: wh.topic });
-      } else {
-        logger.error('Failed to register webhook', error, { shop, topic: wh.topic });
-      }
     }
   }
 }
@@ -719,37 +598,14 @@ async function registerWebhooks(shop, accessToken) {
 // HEALTH CHECKS
 // ===========================================
 
-async function checkBubbleHealth() {
-  if (!CONFIG.bubble.apiEndpoint) {
-    return { healthy: false, message: 'Bubble endpoint not configured' };
-  }
-  
-  try {
-    await axios.get(CONFIG.bubble.apiEndpoint.replace('/api/1.1/wf/', ''), {
-      timeout: 5000,
-    });
-    return { healthy: true };
-  } catch (error) {
-    return { 
-      healthy: false, 
-      message: error.message,
-    };
-  }
-}
-
 async function checkStorageHealth() {
   try {
     const testKey = 'health:check';
     const testValue = { timestamp: Date.now() };
-    
     await storage.set(testKey, testValue);
     const retrieved = await storage.get(testKey);
     await storage.delete(testKey);
-    
-    if (retrieved && retrieved.timestamp === testValue.timestamp) {
-      return { healthy: true };
-    }
-    
+    if (retrieved && retrieved.timestamp === testValue.timestamp) return { healthy: true };
     return { healthy: false, message: 'Storage test failed' };
   } catch (error) {
     return { healthy: false, message: error.message };
@@ -757,314 +613,23 @@ async function checkStorageHealth() {
 }
 
 // ===========================================
-// OAUTH ROUTES
+// ROUTES — HEALTH & STATUS
 // ===========================================
 
-app.get('/', async (req, res) => {
-  const { shop, hmac, embedded, host, session, locale, timestamp } = req.query;
-  
-  // Shopify embedded app installation detection
-  const isEmbeddedInstall = embedded === '1' || host;
-  
-  logger.info('Root route accessed', { 
-    shop, 
-    hasHmac: !!hmac,
-    isEmbedded: isEmbeddedInstall,
-    hasHost: !!host,
-  });
-  
-  if (!shop) {
-    return res.send(`
-      <!DOCTYPE html>
-      <html lang="en">
-      <head>
-        <meta charset="utf-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <title>KatiCRM - Shopify Integration</title>
-        <style>
-          * { margin: 0; padding: 0; box-sizing: border-box; }
-          body { 
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-          }
-          .container {
-            background: white;
-            padding: 48px;
-            border-radius: 16px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            max-width: 500px;
-            text-align: center;
-          }
-          .logo { 
-            font-size: 64px; 
-            margin-bottom: 24px;
-          }
-          h1 { 
-            color: #333; 
-            margin-bottom: 12px; 
-            font-size: 32px;
-            font-weight: 700;
-          }
-          .subtitle {
-            color: #666;
-            font-size: 18px;
-            margin-bottom: 32px;
-            line-height: 1.5;
-          }
-          .info {
-            background: #f7fafc;
-            border-left: 4px solid #667eea;
-            padding: 16px;
-            margin-bottom: 32px;
-            text-align: left;
-            border-radius: 4px;
-          }
-          .info p {
-            color: #555;
-            line-height: 1.6;
-            margin-bottom: 8px;
-          }
-          .info p:last-child { margin-bottom: 0; }
-          .button {
-            display: inline-block;
-            background: #667eea;
-            color: white;
-            padding: 14px 32px;
-            border-radius: 8px;
-            text-decoration: none;
-            font-weight: 600;
-            font-size: 16px;
-            transition: all 0.3s;
-          }
-          .button:hover { 
-            background: #5568d3; 
-            transform: translateY(-2px);
-          }
-        </style>
-      </head>
-      <body>
-        <div class="container">
-          <div class="logo">🛡️</div>
-          <h1>KatiCRM</h1>
-          <p class="subtitle">Omni-channel CRM for Shopify</p>
-          
-          <div class="info">
-            <p><strong>Standalone App Mode</strong></p>
-            <p>Access KatiCRM directly after connecting your store.</p>
-          </div>
-          
-          <a href="${CONFIG.bubble.landingUrl}" class="button">Go to KatiCRM</a>
-        </div>
-      </body>
-      </html>
-    `);
-  }
-  
-  const validation = validateShopInput(shop);
-  if (!validation.valid) {
-    return res.status(400).send('Invalid shop domain');
-  }
-  
-  const validatedShop = validation.shop;
-  
-  if (hmac && !verifyHmac(req.query, hmac)) {
-    logger.warn('HMAC verification failed', { shop: validatedShop });
-    return res.status(403).send('HMAC validation failed');
-  }
-  
-  // Handle embedded app installation from Shopify App Store
-  if (isEmbeddedInstall) {
-    logger.info('Embedded app installation detected, starting OAuth', { 
-      shop: validatedShop,
-      embedded,
-      host,
-    });
-    
-    // For embedded apps, start OAuth immediately with auto-generated state
-    const state = generateNonce();
-    await saveState(validatedShop, state);
-    
-    const redirectUri = `${CONFIG.app.url}/auth/callback`;
-    const shopifyAuthUrl = `https://${validatedShop}/admin/oauth/authorize?` + querystring.stringify({
-      client_id: CONFIG.shopify.apiKey,
-      scope: CONFIG.shopify.scopes,
-      redirect_uri: redirectUri,
-      state: state,
-    });
-    
-    logger.info('Redirecting embedded install to Shopify OAuth', { 
-      shop: validatedShop,
-      redirectUri,
-    });
-    
-    return res.redirect(shopifyAuthUrl);
-  }
-  
-  // For non-embedded installations, redirect to KatiCRM
-  logger.info('App installation redirect to KatiCRM', { shop: validatedShop });
-  
-  const landingUrl = new URL(CONFIG.bubble.landingUrl);
-  landingUrl.searchParams.append('shop', validatedShop);
-  landingUrl.searchParams.append('success', 'false');
-  landingUrl.searchParams.append('install', 'true');
-  
-  res.redirect(landingUrl.toString());
+app.get('/', (req, res) => {
+  res.json({ status: 'ok', service: 'KatiCRM Shopify Middleware', version: '4.0.0' });
 });
-
-app.get('/auth/shopify', async (req, res) => {
-  const { shop, state } = req.query;
-  
-  logger.info('OAuth initiation', { shop, hasState: !!state });
-  
-  if (!shop) {
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=missing_shop`);
-  }
-  
-  const validation = validateShopInput(shop);
-  if (!validation.valid) {
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=invalid_shop`);
-  }
-  
-  const validatedShop = validation.shop;
-  
-  // Generate state if not provided (for backward compatibility)
-  let oauthState = state;
-  if (!state || state === 'direct_install') {
-    logger.warn('OAuth initiated without state parameter - generating one', { shop: validatedShop });
-    oauthState = generateNonce();
-  }
-  
-  try {
-    await saveState(validatedShop, oauthState);
-    
-    const redirectUri = `${CONFIG.app.url}/auth/callback`;
-    const shopifyAuthUrl = `https://${validatedShop}/admin/oauth/authorize?` + querystring.stringify({
-      client_id: CONFIG.shopify.apiKey,
-      scope: CONFIG.shopify.scopes,
-      redirect_uri: redirectUri,
-      state: oauthState,
-    });
-    
-    logger.info('Redirecting to Shopify OAuth', { shop: validatedShop });
-    res.redirect(shopifyAuthUrl);
-    
-  } catch (error) {
-    logger.error('OAuth initiation error', error, { shop: validatedShop });
-    res.redirect(`${CONFIG.bubble.errorUrl}?error=oauth_init_failed`);
-  }
-});
-
-app.get('/auth/callback', async (req, res) => {
-  const { shop, code, state, hmac } = req.query;
-  
-  logger.info('OAuth callback', { shop, hasCode: !!code, hasState: !!state });
-  
-  if (!shop || !code || !state) {
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=missing_parameters`);
-  }
-  
-  const validation = validateShopInput(shop);
-  if (!validation.valid) {
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=invalid_shop`);
-  }
-  
-  const validatedShop = validation.shop;
-  
-  if (!hmac || !verifyHmac(req.query, hmac)) {
-    logger.error('HMAC verification failed', { shop: validatedShop });
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=hmac_failed`);
-  }
-  
-  const stateValid = await verifyState(validatedShop, state);
-  if (!stateValid) {
-    logger.error('State verification failed', { shop: validatedShop });
-    return res.redirect(`${CONFIG.bubble.errorUrl}?error=state_failed`);
-  }
-  
-  try {
-    logger.info('Exchanging code for token', { shop: validatedShop });
-    const { accessToken, scope } = await getAccessToken(validatedShop, code);
-    
-    // Save token to Railway storage (primary source of truth)
-    await saveShop(validatedShop, accessToken, scope);
-    
-    // Send to Bubble asynchronously (secondary backup)
-    setImmediate(async () => {
-      try {
-        // Fetch real Shopify data to demonstrate API usage and accurate sync
-        const shopifyData = await fetchShopifyData(validatedShop, accessToken);
-
-        const bubbleResult = await sendToBubble(CONFIG.bubble.apiEndpoint, {
-          shop: validatedShop,
-          shop_domain: validatedShop,
-          access_token: accessToken,
-          scope: scope,
-          installed_at: new Date().toISOString(),
-          connected_at: new Date().toISOString(),
-          status: 'connected',
-          source: 'oauth_callback',
-          ...(shopifyData || {}),
-        });
-
-        if (!bubbleResult.success) {
-          logger.warn('Bubble sync failed', { shop: validatedShop, error: bubbleResult.error });
-        }
-
-        // Register order/customer webhooks for ongoing data sync
-        await registerWebhooks(validatedShop, accessToken);
-      } catch (error) {
-        logger.error('Error sending to Bubble', error, { shop: validatedShop });
-      }
-    });
-    
-    logger.info('OAuth success, redirecting to KatiCRM', { shop: validatedShop });
-    
-    const successUrl = new URL(CONFIG.bubble.successUrl);
-    successUrl.searchParams.append('shop', validatedShop);
-    successUrl.searchParams.append('connected', 'true');
-    successUrl.searchParams.append('success', 'true');
-    successUrl.searchParams.append('token_stored', 'true');
-    
-    res.redirect(successUrl.toString());
-    
-  } catch (error) {
-    logger.error('OAuth callback error', error, { shop: validatedShop });
-    
-    const errorUrl = new URL(CONFIG.bubble.errorUrl);
-    errorUrl.searchParams.append('error', 'installation_failed');
-    errorUrl.searchParams.append('shop', validatedShop);
-    
-    res.redirect(errorUrl.toString());
-  }
-});
-
-// ===========================================
-// PUBLIC ENDPOINTS
-// ===========================================
 
 app.get('/health', async (req, res) => {
-  const [storageHealth, bubbleHealth] = await Promise.all([
-    checkStorageHealth(),
-    checkBubbleHealth(),
-  ]);
-  
-  const allHealthy = storageHealth.healthy && bubbleHealth.healthy;
-  
-  res.status(allHealthy ? 200 : 503).json({
-    status: allHealthy ? 'healthy' : 'degraded',
+  const storageHealth = await checkStorageHealth();
+
+  res.status(storageHealth.healthy ? 200 : 503).json({
+    status: storageHealth.healthy ? 'healthy' : 'degraded',
     timestamp: new Date().toISOString(),
-    service: 'KatiCRM OAuth Middleware',
-    version: '3.5.0',
+    service: 'KatiCRM Shopify Middleware',
+    version: '4.0.0',
     uptime: process.uptime(),
-    dependencies: {
-      storage: storageHealth,
-      bubble: bubbleHealth,
-    },
+    storage: storageHealth,
   });
 });
 
@@ -1077,465 +642,173 @@ app.get('/ping', (req, res) => {
 });
 
 // ===========================================
-// TOKEN RETRIEVAL API (NEW)
+// ROUTES — SESSION TOKEN AUTH
 // ===========================================
 
 /**
- * GET /api/token/:shop
- * 
- * Check if a shop has an existing access token stored in Railway
- * This allows Bubble to detect existing connections without triggering new OAuth
- * 
- * Returns:
- * - 200: Token exists and is returned
- * - 404: No token found for this shop
- * - 400: Invalid shop parameter
+ * POST /api/shopify/auth
+ *
+ * Called by the React embedded app on startup.
+ * Verifies the App Bridge session token, exchanges it for an offline access token
+ * via Shopify Token Exchange, stores it, and registers webhooks.
+ *
+ * Headers:  Authorization: Bearer <session_token>
+ * Response: { shop, accessTokenStored: true, source: 'cache' | 'token_exchange' }
  */
-app.get('/api/token/:shop', async (req, res) => {
-  const validation = validateShopInput(req.params.shop);
-  
-  if (!validation.valid) {
-    logger.warn('Token lookup - invalid shop', { shop: req.params.shop });
-    return res.status(400).json({ 
-      success: false,
-      error: validation.error,
-      requiresAuth: true,
+app.post('/api/shopify/auth', requireSessionToken, async (req, res) => {
+  const shop = req.shopifyShop;
+
+  try {
+    // Return early if we already have a stored token (avoid duplicate exchanges)
+    const existingToken = await getAccessTokenForShop(shop);
+    if (existingToken) {
+      logger.info('Auth: returning cached token', { shop });
+      return res.json({ shop, accessTokenStored: true, source: 'cache' });
+    }
+
+    // Exchange the App Bridge session token for a persistent offline access token
+    logger.info('Auth: exchanging session token for offline token', { shop });
+    const { accessToken, scope } = await exchangeTokenForOfflineToken(shop, req.shopifyToken);
+    await saveShop(shop, accessToken, scope);
+
+    // Background: notify Bubble and register webhooks (non-blocking)
+    setImmediate(async () => {
+      try {
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop,
+          access_token: accessToken,
+          scope,
+          status: 'connected',
+          source: 'token_exchange',
+          installed_at: new Date().toISOString(),
+        });
+        await registerWebhooks(shop, accessToken);
+      } catch (err) {
+        logger.error('Post-auth background task failed', err, { shop });
+      }
     });
+
+    return res.json({ shop, accessTokenStored: true, source: 'token_exchange' });
+  } catch (error) {
+    logger.error('Auth error', error, { shop });
+    return res.status(500).json({ error: 'Authentication failed', detail: error.message });
   }
-  
-  const shop = validation.shop;
-  
+});
+
+/**
+ * POST /api/shopify/graphql
+ *
+ * GraphQL proxy — forwards queries and mutations from the React app or Bubble
+ * to the Shopify Admin GraphQL API using the stored offline access token.
+ *
+ * Headers:  Authorization: Bearer <session_token>
+ *           Content-Type: application/json
+ * Body:     { query: "...", variables: {} }
+ * Response: Shopify GraphQL response verbatim (including data.errors if present)
+ */
+app.post('/api/shopify/graphql', requireSessionToken, async (req, res) => {
+  const shop = req.shopifyShop;
+  const { query, variables } = req.body;
+
+  if (!query) {
+    return res.status(400).json({ error: 'Missing query field in request body' });
+  }
+
   try {
     const accessToken = await getAccessTokenForShop(shop);
-    
     if (!accessToken) {
-      logger.info('Token lookup - no token found', { shop });
-      return res.status(404).json({
-        success: false,
-        message: 'No token found for this shop',
-        requiresAuth: true,
+      return res.status(401).json({
+        error: 'Shop not authenticated. Call POST /api/shopify/auth first.',
         shop,
       });
     }
-    
-    // Get additional shop data
-    const shopData = await getShop(shop);
-    
-    logger.info('Token lookup - token found', { shop });
-    
-    return res.json({
-      success: true,
-      shop,
-      access_token: accessToken,
-      scope: shopData?.scope || CONFIG.shopify.scopes,
-      installed_at: shopData?.installedAt || new Date().toISOString(),
-      last_updated: shopData?.lastUpdated || new Date().toISOString(),
-      source: 'railway_storage',
-      status: 'connected',
-    });
-    
+
+    const response = await axios.post(
+      `https://${shop}/admin/api/${CONFIG.shopify.apiVersion}/graphql.json`,
+      { query, variables },
+      {
+        headers: {
+          'X-Shopify-Access-Token': accessToken,
+          'Content-Type': 'application/json',
+        },
+        timeout: CONFIG.timeouts.axios,
+      }
+    );
+
+    // Forward Shopify's status code and body verbatim (includes data.errors for partial errors)
+    return res.status(response.status).json(response.data);
   } catch (error) {
-    logger.error('Token lookup error', error, { shop });
-    return res.status(500).json({
-      success: false,
-      error: 'Failed to retrieve token',
-      requiresAuth: true,
-    });
+    const status = error.response?.status || 502;
+    const body = error.response?.data || { error: error.message };
+    logger.error('GraphQL proxy error', error, { shop });
+    return res.status(status).json(body);
   }
 });
+
+// ===========================================
+// ROUTES — APP LIFECYCLE WEBHOOKS
+// ===========================================
 
 /**
- * GET /api/token-status/:shop
- * 
- * Lightweight endpoint to check if a token exists without returning it
- * Useful for quick connection status checks
+ * POST /webhooks/app/uninstalled
+ * Cleans up stored tokens and notifies Bubble when the app is uninstalled.
  */
-app.get('/api/token-status/:shop', async (req, res) => {
-  const validation = validateShopInput(req.params.shop);
-  
-  if (!validation.valid) {
-    return res.status(400).json({ 
-      connected: false,
-      error: validation.error,
-    });
-  }
-  
-  const shop = validation.shop;
-  
-  try {
-    const hasToken = await hasValidToken(shop);
-    
-    if (hasToken) {
-      const shopData = await getShop(shop);
-      return res.json({
-        connected: true,
-        shop,
-        installed_at: shopData?.installedAt,
-        last_updated: shopData?.lastUpdated,
-      });
-    }
-    
-    return res.json({
-      connected: false,
-      shop,
-      requiresAuth: true,
-    });
-    
-  } catch (error) {
-    logger.error('Token status check error', error, { shop });
-    return res.status(500).json({
-      connected: false,
-      error: 'Failed to check token status',
-    });
-  }
-});
-
-// ===========================================
-// SHOP API ENDPOINTS
-// ===========================================
-
-app.get('/api/shop/:shop', async (req, res) => {
-  const validation = validateShopInput(req.params.shop);
-  
-  if (!validation.valid) {
-    return res.status(400).json({ error: 'Invalid shop', connected: false });
-  }
-  
-  const shopData = await getShop(validation.shop);
-  
-  if (!shopData) {
-    return res.status(404).json({ error: 'Shop not found', connected: false });
-  }
-  
-  res.json({
-    shop: shopData.shop,
-    connected: true,
-    installed_at: shopData.installedAt,
-    last_updated: shopData.lastUpdated,
-    scope: shopData.scope,
-  });
-});
-
-/**
- * GET /api/shop/:shop/sync
- * Fetch live data from Shopify APIs and sync to Bubble.io
- * Demonstrates real Shopify API usage and accurate data synchronization
- */
-app.get('/api/shop/:shop/sync', async (req, res) => {
-  const validation = validateShopInput(req.params.shop);
-
-  if (!validation.valid) {
-    return res.status(400).json({ error: 'Invalid shop', success: false });
-  }
-
-  const shop = validation.shop;
-  const accessToken = await getAccessTokenForShop(shop);
-
-  if (!accessToken) {
-    return res.status(404).json({ error: 'Shop not connected', success: false, requiresAuth: true });
-  }
-
-  try {
-    const shopifyData = await fetchShopifyData(shop, accessToken);
-
-    if (!shopifyData) {
-      return res.status(502).json({ error: 'Failed to fetch data from Shopify', success: false });
-    }
-
-    const payload = {
-      shop,
-      ...shopifyData,
-      synced_at: new Date().toISOString(),
-    };
-
-    // Forward to Bubble.io asynchronously
-    setImmediate(async () => {
-      try {
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
-          ...payload,
-          type: 'sync',
-          source: 'manual_sync',
-        });
-      } catch (error) {
-        logger.error('Failed to sync to Bubble', error, { shop });
-      }
-    });
-
-    logger.info('Shop sync completed', { shop });
-    return res.json({ success: true, ...payload });
-  } catch (error) {
-    logger.error('Sync error', error, { shop });
-    return res.status(500).json({ error: 'Sync failed', success: false });
-  }
-});
-
-app.post('/api/shop/:shop/disconnect', async (req, res) => {
-  const validation = validateShopInput(req.params.shop);
-  
-  if (!validation.valid) {
-    return res.status(400).json({ error: 'Invalid shop', success: false });
-  }
-  
-  const shopData = await getShop(validation.shop);
-  
-  if (!shopData) {
-    return res.status(404).json({ error: 'Shop not found', success: false });
-  }
-  
-  try {
-    await deleteShop(validation.shop);
-    
-    // Notify Bubble of disconnection
-    setImmediate(async () => {
-      try {
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
-          shop: validation.shop,
-          status: 'disconnected',
-          disconnected_at: new Date().toISOString(),
-        });
-      } catch (error) {
-        logger.error('Failed to notify Bubble of disconnection', error);
-      }
-    });
-    
-    res.json({ success: true, shop: validation.shop });
-  } catch (error) {
-    logger.error('Disconnect error', error);
-    res.status(500).json({ error: 'Failed to disconnect', success: false });
-  }
-});
-
-// ===========================================
-// ADMIN ENDPOINTS
-// ===========================================
-
-function requireAdminAuth(req, res, next) {
-  const authHeader = req.headers.authorization;
-  
-  if (!authHeader || authHeader !== `Bearer ${CONFIG.app.adminPassword}`) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  
-  next();
-}
-
-app.get('/admin/status', requireAdminAuth, async (req, res) => {
-  const storageHealth = await checkStorageHealth();
-  const bubbleHealth = await checkBubbleHealth();
-  
-  // Count stored tokens
-  let tokenCount = 0;
-  try {
-    const tokenKeys = await storage.keys('token:*');
-    tokenCount = tokenKeys.length;
-  } catch (error) {
-    logger.error('Failed to count tokens', error);
-  }
-  
-  res.json({
-    service: 'KatiCRM OAuth Middleware',
-    version: '3.5.0',
-    oauthMode: 'katicrm-only',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    statistics: {
-      connectedShops: tokenCount,
-    },
-    health: {
-      storage: storageHealth,
-      bubble: bubbleHealth,
-    },
-  });
-});
-
-app.get('/admin/shops', requireAdminAuth, async (req, res) => {
-  try {
-    const shopKeys = await storage.keys('shop:*');
-    const shops = [];
-    
-    for (const key of shopKeys) {
-      const shopData = await storage.get(key);
-      if (shopData) {
-        shops.push({
-          shop: shopData.shop,
-          installed_at: shopData.installedAt,
-          last_updated: shopData.lastUpdated,
-          scope: shopData.scope,
-        });
-      }
-    }
-    
-    res.json({
-      success: true,
-      count: shops.length,
-      shops,
-    });
-  } catch (error) {
-    logger.error('Failed to list shops', error);
-    res.status(500).json({ error: 'Failed to retrieve shops' });
-  }
-});
-
-// ===========================================
-// GDPR WEBHOOKS
-// ===========================================
-
-async function processWebhookIdempotent(webhookId, handler) {
-  const key = `webhook:processed:${webhookId}`;
-  
-  if (await storage.exists(key)) {
-    logger.info('Webhook already processed', { webhookId });
-    return { alreadyProcessed: true };
-  }
-  
-  const result = await handler();
-  await storage.set(key, { processed: true }, 86400);
-  
-  return result;
-}
-
-app.post('/webhooks/customers/data_request', async (req, res) => {
+app.post('/webhooks/app/uninstalled', async (req, res) => {
   const shop = req.get('X-Shopify-Shop-Domain');
   const hmac = req.get('X-Shopify-Hmac-Sha256');
-  
   const rawBody = req.body;
-  let body;
-  
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-  
+
   if (!hmac || !verifyWebhook(rawBody, hmac)) {
     return res.status(401).send('Unauthorized');
   }
-  
+
   res.status(200).send('Acknowledged');
-  
-  setImmediate(async () => {
-    try {
-      await sendToBubble(CONFIG.bubble.gdpr.dataRequest, {
-        shop: shop || body.shop_domain,
-        customer_email: body.customer?.email,
-        received_at: new Date().toISOString(),
-      });
-    } catch (error) {
-      logger.error('GDPR webhook error', error);
-    }
-  });
-});
 
-app.post('/webhooks/customers/redact', async (req, res) => {
-  const shop = req.get('X-Shopify-Shop-Domain');
-  const hmac = req.get('X-Shopify-Hmac-Sha256');
-  
-  const rawBody = req.body;
-  let body;
-  
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-  
-  if (!hmac || !verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
-  
-  res.status(200).send('Will be redacted');
-  
   setImmediate(async () => {
     try {
-      await sendToBubble(CONFIG.bubble.gdpr.customerRedact, {
-        shop: shop || body.shop_domain,
-        customer_email: body.customer?.email,
+      logger.info('App uninstalled webhook received', { shop });
+      if (shop) await deleteShop(shop);
+      await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        shop,
+        topic: 'app/uninstalled',
+        data: {},
         received_at: new Date().toISOString(),
       });
-    } catch (error) {
-      logger.error('GDPR webhook error', error);
-    }
-  });
-});
-
-app.post('/webhooks/shop/redact', async (req, res) => {
-  const shop = req.get('X-Shopify-Shop-Domain');
-  const hmac = req.get('X-Shopify-Hmac-Sha256');
-  
-  const rawBody = req.body;
-  let body;
-  
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-  
-  if (!hmac || !verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
-  
-  const shopDomain = shop || body.shop_domain;
-  if (shopDomain) {
-    await deleteShop(shopDomain);
-  }
-  
-  res.status(200).send('Will be redacted');
-  
-  setImmediate(async () => {
-    try {
-      await sendToBubble(CONFIG.bubble.gdpr.shopRedact, {
-        shop: shopDomain,
-        received_at: new Date().toISOString(),
-      });
-    } catch (error) {
-      logger.error('GDPR webhook error', error);
+    } catch (err) {
+      logger.error('Uninstall webhook error', err, { shop });
     }
   });
 });
 
 // ===========================================
-// ORDER & CUSTOMER WEBHOOKS
+// ROUTES — ORDER WEBHOOKS
 // ===========================================
 
 app.post('/webhooks/orders/create', async (req, res) => {
   const shop = req.get('X-Shopify-Shop-Domain');
   const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const webhookId = req.get('X-Shopify-Webhook-Id');
   const rawBody = req.body;
 
-  let body;
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-
-  if (!hmac || !verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
 
   res.status(200).send('Acknowledged');
 
   setImmediate(async () => {
     try {
-      logger.info('Order created webhook received', { shop, orderId: body.id });
-      await sendToBubble(CONFIG.bubble.apiEndpoint, {
-        type: 'order_created',
-        shop,
-        order_id: body.id,
-        order_name: body.name,
-        total_price: body.total_price,
-        currency: body.currency,
-        customer_email: body.email,
-        created_at: body.created_at,
-        received_at: new Date().toISOString(),
+      await processWebhookIdempotent(webhookId || `orders_create_${shop}_${Date.now()}`, async () => {
+        logger.info('Order created', { shop, orderId: parsed.body.id });
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop,
+          topic: 'orders/create',
+          data: parsed.body,
+          received_at: new Date().toISOString(),
+        });
       });
-    } catch (error) {
-      logger.error('Order create webhook error', error, { shop });
+    } catch (err) {
+      logger.error('Order create webhook error', err, { shop });
     }
   });
 });
@@ -1543,75 +816,61 @@ app.post('/webhooks/orders/create', async (req, res) => {
 app.post('/webhooks/orders/updated', async (req, res) => {
   const shop = req.get('X-Shopify-Shop-Domain');
   const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const webhookId = req.get('X-Shopify-Webhook-Id');
   const rawBody = req.body;
 
-  let body;
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-
-  if (!hmac || !verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
 
   res.status(200).send('Acknowledged');
 
   setImmediate(async () => {
     try {
-      logger.info('Order updated webhook received', { shop, orderId: body.id });
-      await sendToBubble(CONFIG.bubble.apiEndpoint, {
-        type: 'order_updated',
-        shop,
-        order_id: body.id,
-        order_name: body.name,
-        financial_status: body.financial_status,
-        fulfillment_status: body.fulfillment_status,
-        updated_at: body.updated_at,
-        received_at: new Date().toISOString(),
+      await processWebhookIdempotent(webhookId || `orders_updated_${shop}_${Date.now()}`, async () => {
+        logger.info('Order updated', { shop, orderId: parsed.body.id });
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop,
+          topic: 'orders/updated',
+          data: parsed.body,
+          received_at: new Date().toISOString(),
+        });
       });
-    } catch (error) {
-      logger.error('Order updated webhook error', error, { shop });
+    } catch (err) {
+      logger.error('Order updated webhook error', err, { shop });
     }
   });
 });
 
+// ===========================================
+// ROUTES — CUSTOMER WEBHOOKS
+// ===========================================
+
 app.post('/webhooks/customers/create', async (req, res) => {
   const shop = req.get('X-Shopify-Shop-Domain');
   const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const webhookId = req.get('X-Shopify-Webhook-Id');
   const rawBody = req.body;
 
-  let body;
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-
-  if (!hmac || !verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
 
   res.status(200).send('Acknowledged');
 
   setImmediate(async () => {
     try {
-      logger.info('Customer created webhook received', { shop, customerId: body.id });
-      await sendToBubble(CONFIG.bubble.apiEndpoint, {
-        type: 'customer_created',
-        shop,
-        customer_id: body.id,
-        customer_email: body.email,
-        first_name: body.first_name,
-        last_name: body.last_name,
-        created_at: body.created_at,
-        received_at: new Date().toISOString(),
+      await processWebhookIdempotent(webhookId || `customers_create_${shop}_${Date.now()}`, async () => {
+        logger.info('Customer created', { shop, customerId: parsed.body.id });
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop,
+          topic: 'customers/create',
+          data: parsed.body,
+          received_at: new Date().toISOString(),
+        });
       });
-    } catch (error) {
-      logger.error('Customer create webhook error', error, { shop });
+    } catch (err) {
+      logger.error('Customer create webhook error', err, { shop });
     }
   });
 });
@@ -1619,37 +878,139 @@ app.post('/webhooks/customers/create', async (req, res) => {
 app.post('/webhooks/customers/updated', async (req, res) => {
   const shop = req.get('X-Shopify-Shop-Domain');
   const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const webhookId = req.get('X-Shopify-Webhook-Id');
   const rawBody = req.body;
 
-  let body;
-  try {
-    const bodyString = Buffer.isBuffer(rawBody) ? rawBody.toString('utf8') : rawBody;
-    body = JSON.parse(bodyString);
-  } catch (error) {
-    return res.status(400).send('Invalid JSON');
-  }
-
-  if (!hmac || !verifyWebhook(rawBody, hmac)) {
-    return res.status(401).send('Unauthorized');
-  }
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
 
   res.status(200).send('Acknowledged');
 
   setImmediate(async () => {
     try {
-      logger.info('Customer updated webhook received', { shop, customerId: body.id });
-      await sendToBubble(CONFIG.bubble.apiEndpoint, {
-        type: 'customer_updated',
-        shop,
-        customer_id: body.id,
-        customer_email: body.email,
-        first_name: body.first_name,
-        last_name: body.last_name,
-        updated_at: body.updated_at,
+      await processWebhookIdempotent(webhookId || `customers_updated_${shop}_${Date.now()}`, async () => {
+        logger.info('Customer updated', { shop, customerId: parsed.body.id });
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop,
+          topic: 'customers/updated',
+          data: parsed.body,
+          received_at: new Date().toISOString(),
+        });
+      });
+    } catch (err) {
+      logger.error('Customer updated webhook error', err, { shop });
+    }
+  });
+});
+
+// ===========================================
+// ROUTES — PRODUCT WEBHOOKS
+// ===========================================
+
+app.post('/webhooks/products/update', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const webhookId = req.get('X-Shopify-Webhook-Id');
+  const rawBody = req.body;
+
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
+
+  res.status(200).send('Acknowledged');
+
+  setImmediate(async () => {
+    try {
+      await processWebhookIdempotent(webhookId || `products_update_${shop}_${Date.now()}`, async () => {
+        logger.info('Product updated', { shop, productId: parsed.body.id });
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+          shop,
+          topic: 'products/update',
+          data: parsed.body,
+          received_at: new Date().toISOString(),
+        });
+      });
+    } catch (err) {
+      logger.error('Product update webhook error', err, { shop });
+    }
+  });
+});
+
+// ===========================================
+// ROUTES — GDPR MANDATORY WEBHOOKS
+// ===========================================
+
+app.post('/webhooks/customers/data_request', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
+
+  res.status(200).send('Acknowledged');
+
+  setImmediate(async () => {
+    try {
+      await sendToBubble(CONFIG.bubble.gdpr.dataRequest, {
+        shop: shop || parsed.body.shop_domain,
+        customer_email: parsed.body.customer?.email,
         received_at: new Date().toISOString(),
       });
-    } catch (error) {
-      logger.error('Customer updated webhook error', error, { shop });
+    } catch (err) {
+      logger.error('GDPR data_request webhook error', err);
+    }
+  });
+});
+
+app.post('/webhooks/customers/redact', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
+
+  res.status(200).send('Will be redacted');
+
+  setImmediate(async () => {
+    try {
+      await sendToBubble(CONFIG.bubble.gdpr.customerRedact, {
+        shop: shop || parsed.body.shop_domain,
+        customer_email: parsed.body.customer?.email,
+        received_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error('GDPR customers/redact webhook error', err);
+    }
+  });
+});
+
+app.post('/webhooks/shop/redact', async (req, res) => {
+  const shop = req.get('X-Shopify-Shop-Domain');
+  const hmac = req.get('X-Shopify-Hmac-Sha256');
+  const rawBody = req.body;
+
+  const parsed = parseWebhookBody(rawBody);
+  if (!parsed.ok) return res.status(400).send('Invalid JSON');
+  if (!hmac || !verifyWebhook(rawBody, hmac)) return res.status(401).send('Unauthorized');
+
+  const shopDomain = shop || parsed.body.shop_domain;
+  if (shopDomain) await deleteShop(shopDomain);
+
+  res.status(200).send('Will be redacted');
+
+  setImmediate(async () => {
+    try {
+      await sendToBubble(CONFIG.bubble.gdpr.shopRedact, {
+        shop: shopDomain,
+        received_at: new Date().toISOString(),
+      });
+    } catch (err) {
+      logger.error('GDPR shop/redact webhook error', err);
     }
   });
 });
@@ -1672,8 +1033,8 @@ app.use((err, req, res, next) => {
 // ===========================================
 
 function gracefulShutdown(signal) {
-  logger.info(`${signal} received, shutting down`);
-  
+  logger.info(`${signal} received, shutting down gracefully`);
+
   server.close(() => {
     if (CONFIG.redis.enabled && redisClient) {
       redisClient.quit(() => process.exit(0));
@@ -1681,10 +1042,8 @@ function gracefulShutdown(signal) {
       process.exit(0);
     }
   });
-  
-  setTimeout(() => {
-    process.exit(1);
-  }, CONFIG.timeouts.gracefulShutdown);
+
+  setTimeout(() => process.exit(1), CONFIG.timeouts.gracefulShutdown);
 }
 
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
@@ -1695,27 +1054,34 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 // ===========================================
 
 const server = app.listen(PORT, () => {
+  logger.info('KatiCRM Shopify Middleware v4.0 started', {
+    port: PORT,
+    env: NODE_ENV,
+    storage: CONFIG.redis.enabled ? 'redis' : 'memory',
+    webhookBaseUrl: CONFIG.webhookBaseUrl || 'not set (webhook registration disabled)',
+  });
   console.log('');
-  console.log('╔═══════════════════════════════════════════════════════╗');
-  console.log('║  🛡️  KatiCRM OAuth v3.5 - TOKEN RETRIEVAL ENABLED   ║');
-  console.log('╚═══════════════════════════════════════════════════════╝');
+  console.log('╔══════════════════════════════════════════════════════════╗');
+  console.log('║   KatiCRM Shopify Middleware v4.0 — Session Token Auth  ║');
+  console.log('╚══════════════════════════════════════════════════════════╝');
   console.log('');
-  console.log(`📡 Server: http://localhost:${PORT}`);
-  console.log(`🔗 OAuth: ${CONFIG.app.url}/auth/shopify`);
-  console.log(`🔑 Token API: ${CONFIG.app.url}/api/token/:shop`);
-  console.log(`✅ Success: ${CONFIG.bubble.successUrl}`);
-  console.log(`🏠 Landing: ${CONFIG.bubble.landingUrl}`);
+  console.log(`📡 Listening on port ${PORT}`);
   console.log('');
-  console.log('🔒 SECURITY: State parameter REQUIRED');
-  console.log('   ✅ Direct OAuth BLOCKED');
-  console.log('   ✅ Only KatiCRM button allows OAuth');
+  console.log('🔐 Auth:      POST /api/shopify/auth     (session token → offline token)');
+  console.log('🔍 GraphQL:   POST /api/shopify/graphql  (queries + mutations proxy)');
   console.log('');
-  console.log('🆕 NEW FEATURES:');
-  console.log('   ✅ Token retrieval API');
-  console.log('   ✅ Connection status checks');
-  console.log('   ✅ Optimized token storage');
-  console.log('   ✅ Prevents duplicate OAuth flows');
+  console.log('📦 Webhooks:');
+  console.log('   POST /webhooks/app/uninstalled');
+  console.log('   POST /webhooks/orders/create');
+  console.log('   POST /webhooks/orders/updated');
+  console.log('   POST /webhooks/customers/create');
+  console.log('   POST /webhooks/customers/updated');
+  console.log('   POST /webhooks/products/update');
+  console.log('   POST /webhooks/customers/data_request  (GDPR)');
+  console.log('   POST /webhooks/customers/redact        (GDPR)');
+  console.log('   POST /webhooks/shop/redact             (GDPR)');
   console.log('');
-  console.log('✅ Server ready');
+  console.log(`💾 Storage:   ${CONFIG.redis.enabled ? 'Redis' : 'In-memory (tokens lost on restart)'}`);
+  console.log(`🔗 Webhooks:  ${CONFIG.webhookBaseUrl || 'WEBHOOK_BASE_URL not set — auto-registration disabled'}`);
   console.log('');
 });
