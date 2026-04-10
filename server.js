@@ -44,6 +44,8 @@ const CONFIG = {
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
     wfBaseUrl: process.env.BUBBLE_WF_BASE_URL,
+    wfBaseUrlTest: process.env.BUBBLE_WF_BASE_URL_TEST,
+    useTest: process.env.BUBBLE_USE_TEST === 'true',
     gdpr: {
       dataRequest: process.env.BUBBLE_GDPR_DATA_REQUEST,
       customerRedact: process.env.BUBBLE_GDPR_CUSTOMER_REDACT,
@@ -596,7 +598,10 @@ async function sendToBubble(endpoint, data, retries = 3) {
 }
 
 function bubbleWfUrl(workflowName) {
-  if (CONFIG.bubble.wfBaseUrl) return `${CONFIG.bubble.wfBaseUrl}/${workflowName}`;
+  const base = CONFIG.bubble.useTest
+    ? (CONFIG.bubble.wfBaseUrlTest || CONFIG.bubble.wfBaseUrl)
+    : (CONFIG.bubble.wfBaseUrl || CONFIG.bubble.wfBaseUrlTest);
+  if (base) return `${base}/${workflowName}`;
   return CONFIG.bubble.apiEndpoint;
 }
 
@@ -774,7 +779,7 @@ app.post('/webhooks/app/uninstalled', async (req, res) => {
     try {
       logger.info('App uninstalled webhook received', { shop });
       if (shop) await deleteShop(shop);
-      await sendToBubble(bubbleWfUrl('shopify_app_uninstalled1'), {
+      await sendToBubble(bubbleWfUrl('wh_shopify_uninstall'), {
         shop,
         received_at: new Date().toISOString(),
       });
