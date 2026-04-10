@@ -774,7 +774,7 @@ app.post('/webhooks/app/uninstalled', async (req, res) => {
     try {
       logger.info('App uninstalled webhook received', { shop });
       if (shop) await deleteShop(shop);
-      await sendToBubble(bubbleWfUrl('shopify_app_uninstalled1'), {
+      await sendToBubble(bubbleWfUrl('wh_shopify_uninstall'), {
         shop,
         received_at: new Date().toISOString(),
       });
@@ -832,9 +832,10 @@ app.post('/webhooks/orders/updated', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `orders_updated_${shop}_${Date.now()}`, async () => {
         logger.info('Order updated', { shop, orderId: parsed.body.id });
-        await sendToBubble(bubbleWfUrl('wh_shopify_order_updated'), {
-          ...parsed.body,
+        await sendToBubble(CONFIG.bubble.apiEndpoint, {
           shop,
+          topic: 'orders/updated',
+          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
