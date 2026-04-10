@@ -43,6 +43,7 @@ const CONFIG = {
   },
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
+    wfBaseUrl: process.env.BUBBLE_WF_BASE_URL,
     gdpr: {
       dataRequest: process.env.BUBBLE_GDPR_DATA_REQUEST,
       customerRedact: process.env.BUBBLE_GDPR_CUSTOMER_REDACT,
@@ -594,6 +595,11 @@ async function sendToBubble(endpoint, data, retries = 3) {
   }
 }
 
+function bubbleWfUrl(workflowName) {
+  if (CONFIG.bubble.wfBaseUrl) return `${CONFIG.bubble.wfBaseUrl}/${workflowName}`;
+  return CONFIG.bubble.apiEndpoint;
+}
+
 // ===========================================
 // HEALTH CHECKS
 // ===========================================
@@ -768,10 +774,8 @@ app.post('/webhooks/app/uninstalled', async (req, res) => {
     try {
       logger.info('App uninstalled webhook received', { shop });
       if (shop) await deleteShop(shop);
-      await sendToBubble(CONFIG.bubble.apiEndpoint, {
+      await sendToBubble(bubbleWfUrl('shopify_app_uninstalled1'), {
         shop,
-        topic: 'app/uninstalled',
-        data: {},
         received_at: new Date().toISOString(),
       });
     } catch (err) {
@@ -800,10 +804,9 @@ app.post('/webhooks/orders/create', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `orders_create_${shop}_${Date.now()}`, async () => {
         logger.info('Order created', { shop, orderId: parsed.body.id });
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        await sendToBubble(bubbleWfUrl('wh_shopify_order_created'), {
+          ...parsed.body,
           shop,
-          topic: 'orders/create',
-          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
@@ -829,10 +832,9 @@ app.post('/webhooks/orders/updated', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `orders_updated_${shop}_${Date.now()}`, async () => {
         logger.info('Order updated', { shop, orderId: parsed.body.id });
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        await sendToBubble(bubbleWfUrl('wh_shopify_order_updated'), {
+          ...parsed.body,
           shop,
-          topic: 'orders/updated',
-          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
@@ -862,10 +864,9 @@ app.post('/webhooks/customers/create', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `customers_create_${shop}_${Date.now()}`, async () => {
         logger.info('Customer created', { shop, customerId: parsed.body.id });
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        await sendToBubble(bubbleWfUrl('wh_shopify_customer_created'), {
+          ...parsed.body,
           shop,
-          topic: 'customers/create',
-          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
@@ -891,10 +892,9 @@ app.post('/webhooks/customers/updated', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `customers_updated_${shop}_${Date.now()}`, async () => {
         logger.info('Customer updated', { shop, customerId: parsed.body.id });
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        await sendToBubble(bubbleWfUrl('wh_shopify_customer_updated'), {
+          ...parsed.body,
           shop,
-          topic: 'customers/updated',
-          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
@@ -924,10 +924,9 @@ app.post('/webhooks/products/update', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `products_update_${shop}_${Date.now()}`, async () => {
         logger.info('Product updated', { shop, productId: parsed.body.id });
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        await sendToBubble(bubbleWfUrl('wh_shopify_product_updated'), {
+          ...parsed.body,
           shop,
-          topic: 'products/update',
-          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
