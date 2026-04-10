@@ -44,6 +44,8 @@ const CONFIG = {
   bubble: {
     apiEndpoint: process.env.BUBBLE_API_ENDPOINT,
     wfBaseUrl: process.env.BUBBLE_WF_BASE_URL,
+    wfBaseUrlTest: process.env.BUBBLE_WF_BASE_URL_TEST,
+    useTest: process.env.BUBBLE_USE_TEST === 'true',
     gdpr: {
       dataRequest: process.env.BUBBLE_GDPR_DATA_REQUEST,
       customerRedact: process.env.BUBBLE_GDPR_CUSTOMER_REDACT,
@@ -596,7 +598,10 @@ async function sendToBubble(endpoint, data, retries = 3) {
 }
 
 function bubbleWfUrl(workflowName) {
-  if (CONFIG.bubble.wfBaseUrl) return `${CONFIG.bubble.wfBaseUrl}/${workflowName}`;
+  const base = CONFIG.bubble.useTest
+    ? (CONFIG.bubble.wfBaseUrlTest || CONFIG.bubble.wfBaseUrl)
+    : (CONFIG.bubble.wfBaseUrl || CONFIG.bubble.wfBaseUrlTest);
+  if (base) return `${base}/${workflowName}`;
   return CONFIG.bubble.apiEndpoint;
 }
 
@@ -832,10 +837,9 @@ app.post('/webhooks/orders/updated', async (req, res) => {
     try {
       await processWebhookIdempotent(webhookId || `orders_updated_${shop}_${Date.now()}`, async () => {
         logger.info('Order updated', { shop, orderId: parsed.body.id });
-        await sendToBubble(CONFIG.bubble.apiEndpoint, {
+        await sendToBubble(bubbleWfUrl('wh_shopify_order_updated'), {
+          ...parsed.body,
           shop,
-          topic: 'orders/updated',
-          data: parsed.body,
           received_at: new Date().toISOString(),
         });
       });
